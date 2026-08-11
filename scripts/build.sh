@@ -189,154 +189,6 @@ HOST_CMD=(setup_host debootstrap run_chroot build_iso)
 CHROOT_CMD=(chroot_prepare install_pkg build_image finish_up)
 
 # ---------------------------------------------------------------------------
-# Host (build-time, outside the chroot) package management abstraction.
-#
-# The chroot is always Ubuntu/Debian, so every apt-get call inside the
-# chroot pipeline stays as-is. This abstraction only covers commands that
-# run on the host *before* the chroot exists (setup_host's install of
-# debootstrap / squashfs-tools / xorriso, plus the skip-if-installed check
-# that guards it).
-#
-# Three host families are supported:
-#   deb   - Ubuntu / Debian and derivatives (uses apt + dpkg)
-#   rpm   - openSUSE / SUSE (uses zypper + rpm)
-#   arch  - Arch Linux and derivatives (uses pacman)
-#
-# Everything else calls host_pkg_install() / host_pkg_is_installed() with
-# the *canonical* (Debian-style) name; this layer translates it to the
-# host's package name and runs the host's package manager.
-# ---------------------------------------------------------------------------
-HOST_PKG_FAMILY=""
-HOST_PKG_MANAGER=""   # user-facing tool name: apt / zypper / pacman
-HOST_INSTALL_CMD=()   # array form of the install command (without pkgs)
-HOST_REFRESH_CMD=()   # array form of the DB-refresh command
-
-# Per-family overrides for the host's package name. The key is
-# 'canonical:family' (e.g. 'xorriso:arch'); the value is the host's
-# package name on that family. Anything not listed here uses the
-# canonical (Debian-style) name as-is, which is the right answer for
-# most tools (debootstrap, parted, dosfstools, e2fsprogs, rsync, etc.).
-declare -gA HOST_PKG_NAME=(
-    [squashfs-tools:rpm]=squashfs        # openSUSE: 'squashfs'
-    [xorriso:arch]=libisoburn            # Arch: xorriso binary ships in libisoburn
-    [qemu-utils:rpm]=qemu-tools          # openSUSE: 'qemu-tools'
-    [qemu-utils:arch]=qemu-img           # Arch: 'qemu-img'
-)
-
-# Lookup the host package name for a canonical (Debian) name on the current
-# host family. Falls back to the canonical name if no override is set.
-function host_pkg_name() {
-    local canonical="$1"
-    local key="${canonical}:${HOST_PKG_FAMILY}"
-    if [[ -n "${HOST_PKG_NAME[$key]:-}" ]]; then
-        echo "${HOST_PKG_NAME[$key]}"
-        return
-    fi
-    echo "$canonical"
-}
-
-# Detect the host's package family. Sets HOST_PKG_FAMILY / HOST_PKG_MANAGER
-# and HOST_INSTALL_CMD / HOST_REFRESH_CMD. Errors out on unsupported hosts.
-function host_pkg_detect() {
-    if [[ ! -r /etc/os-release ]]; then
-        >&2 echo "ERROR: /etc/os-release is missing or unreadable; cannot determine host package manager."
-        exit 1
-    fi
-    # shellcheck source=/dev/null
-    . /etc/os-release
-
-    local id="${ID:-}" id_like="${ID_LIKE:-}"
-
-    if [[ "$id" == "ubuntu" ]] || [[ "$id_like" == *ubuntu* ]] || \
-       [[ "$id" == "debian" ]] || [[ "$id_like" == *debian* ]]; then
-        HOST_PKG_FAMILY="deb"
-        HOST_PKG_MANAGER="apt"
-        HOST_INSTALL_CMD=(apt install -y)
-        HOST_REFRESH_CMD=(apt update)
-        return 0
-    fi
-
-    if [[ "$id" == "opensuse-tumbleweed" || "$id" == "opensuse-slowroll" || \
-          "$id_like" == *suse* || "$id_like" == *opensuse* ]]; then
-        # Supported openSUSE targets: Tumbleweed and Slowroll.
-        # openSUSE Leap / SLES are NOT currently planned -- contributions
-        # to add them are welcome.
-        HOST_PKG_FAMILY="rpm"
-        HOST_PKG_MANAGER="zypper"
-        HOST_INSTALL_CMD=(zypper --non-interactive install)
-        HOST_REFRESH_CMD=(zypper --non-interactive refresh)
-        return 0
-    fi
-
-    if [[ "$id" == "arch" || "$id_like" == *arch* ]]; then
-        HOST_PKG_FAMILY="arch"
-        HOST_PKG_MANAGER="pacman"
-        HOST_INSTALL_CMD=(pacman -S --noconfirm --needed)
-        # -Sy, not -Syu: only refresh the package DB; never run a full
-        # system upgrade from a build script -- that is the host owner's
-        # responsibility.
-        HOST_REFRESH_CMD=(pacman -Sy)
-        return 0
-    fi
-
-    >&2 echo "ERROR: Unsupported host OS (ID='${id}', ID_LIKE='${id_like}')."
-    >&2 echo "Supported host families: Ubuntu/Debian, openSUSE/SUSE, Arch."
-    exit 1
-}
-
-# host_pkg_refresh -- refresh the host's package database.
-# Wraps apt update / zypper refresh / pacman -Sy. No-op if the family
-# cannot be detected (caller will have already errored out by then).
-function host_pkg_refresh() {
-    if [[ ${#HOST_REFRESH_CMD[@]} -eq 0 ]]; then
-        return 0
-    fi
-    host_priv "${HOST_REFRESH_CMD[@]}"
-}
-
-# host_pkg_install PKG... -- install the given *canonical* (Debian-style)
-# package names on the host, translating to the host's name where needed.
-function host_pkg_install() {
-    if [[ ${#HOST_INSTALL_CMD[@]} -eq 0 ]]; then
-        return 0
-    fi
-    local -a host_pkgs=()
-    local p
-    for p in "$@"; do
-        host_pkgs+=("$(host_pkg_name "$p")")
-    done
-    host_priv "${HOST_INSTALL_CMD[@]}" "${host_pkgs[@]}"
-}
-
-# host_pkg_is_installed PKG... -- returns 0 iff every named canonical
-# package is installed on the host. Translates names per the host family.
-function host_pkg_is_installed() {
-    local p translated
-    case "$HOST_PKG_FAMILY" in
-        deb)
-            for p in "$@"; do
-                dpkg -s "$(host_pkg_name "$p")" &>/dev/null || return 1
-            done
-            ;;
-        rpm)
-            for p in "$@"; do
-                rpm -q "$(host_pkg_name "$p")" &>/dev/null || return 1
-            done
-            ;;
-        arch)
-            for p in "$@"; do
-                pacman -Q "$(host_pkg_name "$p")" &>/dev/null || return 1
-            done
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-
 # Run host commands as root: sudo when invoked as a normal user, direct exec when already root.
 function host_priv() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -345,6 +197,15 @@ function host_priv() {
         sudo "$@"
     fi
 }
+
+# ---------------------------------------------------------------------------
+# Host (build-time, outside the chroot) package management abstraction --
+# shared with every other build-*.sh script. See host-pkg.sh for details.
+# Sourced here (after host_priv is defined) because the abstraction's
+# install/refresh helpers wrap host_priv.
+# ---------------------------------------------------------------------------
+# shellcheck source=./host-pkg.sh
+source "$SCRIPT_DIR/host-pkg.sh"
 
 # ---------------------------------------------------------------------------
 # Sudo keep-alive: long builds can outlast the default sudo timeout, which
@@ -1207,48 +1068,22 @@ function host_help() {
 }
 
 function check_host_user() {
-    local ID ID_LIKE
+    # Detect the host's package family (deb / rpm / arch). This populates
+    # HOST_PKG_FAMILY etc. and errors out on truly unsupported hosts.
+    host_pkg_detect
 
-    if [[ ! -r /etc/os-release ]]; then
-        >&2 echo "ERROR: /etc/os-release is missing or unreadable."
-        >&2 echo "This script must be run on Ubuntu, Debian, openSUSE/SUSE, or Arch."
-        exit 1
-    fi
-    # shellcheck source=/dev/null
-    . /etc/os-release
-
-    if [[ "${ID:-}" == "ubuntu" ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
-        return 0
-    fi
-
-    if [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; then
-        if [[ "${ID:-}" == "debian" ]] && ! dpkg -s ubuntu-archive-keyring &>/dev/null; then
+    # On a Debian host (not Ubuntu or an Ubuntu derivative) we still need
+    # the Ubuntu archive keyring so debootstrap can verify Ubuntu release
+    # signatures. The other families don't have this requirement.
+    if [[ "${HOST_PKG_FAMILY}" == "deb" ]] && \
+       { [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; } && \
+       { [[ "${ID:-}" != "ubuntu" ]] && [[ "${ID_LIKE:-}" != *ubuntu* ]]; }; then
+        if ! dpkg -s ubuntu-archive-keyring &>/dev/null; then
             >&2 echo "ERROR: On Debian, install the Ubuntu archive keyring before building (required for debootstrap from Ubuntu mirrors):"
             >&2 echo "  sudo apt install ubuntu-archive-keyring"
             exit 1
         fi
-        return 0
     fi
-
-    # openSUSE / SUSE: debootstrap is in the main repos on Tumbleweed
-    # and Slowroll. zypper handles the rest.
-    # (openSUSE Leap and SLES are NOT currently planned targets --
-    # contributions to add them are welcome.)
-    if [[ "${ID:-}" == "opensuse-tumbleweed" || "${ID:-}" == "opensuse-slowroll" || \
-          "${ID_LIKE:-}" == *suse* || "${ID_LIKE:-}" == *opensuse* ]]; then
-        return 0
-    fi
-
-    # Arch Linux and derivatives (e.g. Manjaro, Endeavour): the host
-    # installer maps squashfs-tools -> squashfs, xorriso -> libisoburn,
-    # and qemu-utils -> qemu-img automatically; see HOST_PKG_NAME.
-    if [[ "${ID:-}" == "arch" || "${ID_LIKE:-}" == *arch* ]]; then
-        return 0
-    fi
-
-    >&2 echo "ERROR: Unsupported host OS (ID='${ID:-unknown}', ID_LIKE='${ID_LIKE:-}')."
-    >&2 echo "Supported hosts: Ubuntu, Debian, openSUSE/SUSE, or Arch (and their derivatives)."
-    exit 1
 }
 
 # Package cache: persistent directory bind-mounted into the chroot's APT cache.
@@ -1375,6 +1210,14 @@ function setup_host() {
     # own package names (squashfs-tools -> squashfs on openSUSE,
     # xorriso -> libisoburn on Arch, etc.).
     local -a _host_deps=(debootstrap squashfs-tools xorriso)
+    # On Arch-based hosts, also pull the keyrings debootstrap needs to
+    # verify Ubuntu/Debian release signatures. Arch has no built-in trust
+    # for the Ubuntu or Debian archives, so these have to be installed
+    # explicitly (they live in [extra] / AUR on Arch and are pulled via
+    # pacman here).
+    if [[ "${HOST_PKG_FAMILY}" == "arch" ]]; then
+        _host_deps+=(ubuntu-keyring debian-archive-keyring debian-ports-archive-keyring)
+    fi
 
     local skip_install=0
     if [[ "${LAUNCHED_FROM_START_HERE:-0}" -eq 1 ]]; then
@@ -1416,7 +1259,18 @@ function debootstrap() {
         return 0
     fi
     echo "=====> running debootstrap ... this will take a few minutes ..."
-    host_priv debootstrap --arch=amd64 --variant=minbase "$TARGET_UBUNTU_VERSION" "$WORKSPACE_CHROOT" "$TARGET_UBUNTU_MIRROR"
+    # On openSUSE, debootstrap is not packaged with the Ubuntu/Debian
+    # archive keyrings -- ensure the Ubuntu archive keyring is on the host
+    # and hand it to debootstrap explicitly via --keyring so it can verify
+    # the Ubuntu Release signature.
+    local -a _debootstrap_extra=()
+    if [[ "${HOST_PKG_FAMILY}" == "rpm" ]]; then
+        ensure_ubuntu_keyring_for_opensuse
+        _debootstrap_extra=(--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg)
+    fi
+    host_priv debootstrap --arch=amd64 --variant=minbase \
+        "${_debootstrap_extra[@]}" \
+        "$TARGET_UBUNTU_VERSION" "$WORKSPACE_CHROOT" "$TARGET_UBUNTU_MIRROR"
 }
 
 function run_chroot() {
@@ -2736,10 +2590,6 @@ function host_main() {
     local args=()
 
     set_defaults
-    # Detect the host's package family (deb / rpm / arch) and initialize
-    # the host_pkg_* helpers used by setup_host. Must run before any
-    # code path that touches host-side package management.
-    host_pkg_detect
 
     while [[ $# -gt 0 ]]; do
         case "$1" in

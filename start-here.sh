@@ -300,6 +300,12 @@ esac
 if [[ "$IS_DEBIAN" -eq 1 ]]; then
     DEPS+=("ubuntu-archive-keyring")
 fi
+# On Arch-based hosts, also pull the keyrings debootstrap needs to verify
+# the Ubuntu/Debian release signatures. These are required because pacman
+# hosts have no built-in trust for the Ubuntu or Debian archives.
+if [[ "${HOST_PKG_FAMILY}" == "arch" ]]; then
+    DEPS+=("ubuntu-keyring" "debian-archive-keyring" "debian-ports-archive-keyring")
+fi
 
 if [[ "$GENERATE_CONFIG" -eq 0 ]]; then
     if [[ -n "$HOST_PKG_FAMILY" ]]; then
@@ -350,7 +356,7 @@ if [[ "$GENERATE_CONFIG" -eq 0 ]]; then
             esac
         fi
     else
-        echo "=====> WARNING: host is not detected as Ubuntu, Debian, openSUSE/SUSE, or Arch" >&2
+        echo "=====> WARNING: host is not detected as Ubuntu, Debian, openSUSE (Tumbleweed / Slowroll), or Arch" >&2
         echo "=====>          ($(lsb_release -id 2>/dev/null || echo unknown))." >&2
         echo "=====>          Skipping automatic dependency install. Make sure these are present:" >&2
         printf '=====>            %s\n' "${DEPS[@]}" >&2

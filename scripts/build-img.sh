@@ -232,6 +232,15 @@ function host_priv() {
 }
 
 # ---------------------------------------------------------------------------
+# Host (build-time, outside the chroot) package management abstraction --
+# shared with every other build-*.sh script. See host-pkg.sh for details.
+# Sourced here (after host_priv is defined) because the abstraction's
+# install/refresh helpers wrap host_priv.
+# ---------------------------------------------------------------------------
+# shellcheck source=./host-pkg.sh
+source "$SCRIPT_DIR/host-pkg.sh"
+
+# ---------------------------------------------------------------------------
 # Sudo keep-alive: long builds can outlast the default sudo timeout, which
 # makes apt/chroot steps stall waiting for a password mid-build. Validate
 # credentials once up front, then refresh them in the background. Skipped
@@ -1162,32 +1171,22 @@ function host_help() {
 }
 
 function check_host_user() {
-    local ID ID_LIKE
+    # Detect the host's package family (deb / rpm / arch). This populates
+    # HOST_PKG_FAMILY etc. and errors out on truly unsupported hosts.
+    host_pkg_detect
 
-    if [[ ! -r /etc/os-release ]]; then
-        >&2 echo "ERROR: /etc/os-release is missing or unreadable."
-        >&2 echo "This script must be run on Ubuntu (or an Ubuntu-based distribution) or on Debian (or a Debian-based distribution)."
-        exit 1
-    fi
-    # shellcheck source=/dev/null
-    . /etc/os-release
-
-    if [[ "${ID:-}" == "ubuntu" ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
-        return 0
-    fi
-
-    if [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; then
-        if [[ "${ID:-}" == "debian" ]] && ! dpkg -s ubuntu-archive-keyring &>/dev/null; then
+    # On a Debian host (not Ubuntu or an Ubuntu derivative) we still need
+    # the Ubuntu archive keyring so debootstrap can verify Ubuntu release
+    # signatures. The other families don't have this requirement.
+    if [[ "${HOST_PKG_FAMILY}" == "deb" ]] && \
+       { [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; } && \
+       { [[ "${ID:-}" != "ubuntu" ]] && [[ "${ID_LIKE:-}" != *ubuntu* ]]; }; then
+        if ! dpkg -s ubuntu-archive-keyring &>/dev/null; then
             >&2 echo "ERROR: On Debian, install the Ubuntu archive keyring before building (required for debootstrap from Ubuntu mirrors):"
             >&2 echo "  sudo apt install ubuntu-archive-keyring"
             exit 1
         fi
-        return 0
     fi
-
-    >&2 echo "ERROR: Unsupported host OS (ID='${ID:-unknown}', ID_LIKE='${ID_LIKE:-}')."
-    >&2 echo "Run this script only on Ubuntu or an Ubuntu-based system, or on Debian or a Debian-based system."
-    exit 1
 }
 
 # Package cache: persistent directory bind-mounted into the chroot's APT cache.
@@ -1310,37 +1309,43 @@ function host_build_signal_trap() {
 function setup_host() {
     echo "=====> running setup_host ..."
 
-    local _host_deps=(debootstrap parted dosfstools e2fsprogs rsync)
+    # Canonical (Debian-style) host dependency names. The host-package
+    # abstraction (see host-pkg.sh) translates these to the host family's
+    # own package names (squashfs-tools -> squashfs on openSUSE,
+    # xorriso -> libisoburn on Arch, etc.).
+    local -a _host_deps=(debootstrap parted dosfstools e2fsprogs rsync)
     if [[ "$UVB_IMAGE_KIND" == "vm" ]]; then
         _host_deps+=(qemu-utils)
+    fi
+    # On Arch-based hosts, also pull the keyrings debootstrap needs to
+    # verify Ubuntu/Debian release signatures. Arch has no built-in trust
+    # for the Ubuntu or Debian archives, so these have to be installed
+    # explicitly (they live in [extra] / AUR on Arch and are pulled via
+    # pacman here).
+    if [[ "${HOST_PKG_FAMILY}" == "arch" ]]; then
+        _host_deps+=(ubuntu-keyring debian-archive-keyring debian-ports-archive-keyring)
     fi
 
     local skip_install=0
     if [[ "${LAUNCHED_FROM_START_HERE:-0}" -eq 1 ]]; then
-        if command -v dpkg &>/dev/null && [[ -r /etc/os-release ]]; then
-            local ID ID_LIKE
-            # shellcheck source=/dev/null
-            . /etc/os-release
-            if [[ "${ID:-}" == "ubuntu" ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]] || \
-               [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; then
-                if dpkg -s "${_host_deps[@]}" &>/dev/null; then
-                    skip_install=1
-                    if { [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; } && \
-                       { [[ "${ID:-}" != "ubuntu" ]] && [[ "${ID_LIKE:-}" != *ubuntu* ]]; }; then
-                        if ! dpkg -s ubuntu-archive-keyring &>/dev/null; then
-                            skip_install=0
-                        fi
-                    fi
-                fi
+        if [[ "${HOST_PKG_FAMILY}" == "deb" ]]; then
+            if host_pkg_is_installed "${_host_deps[@]}" \
+               && { ! host_pkg_is_installed ubuntu-archive-keyring || \
+                    { [[ "${ID:-}" == "ubuntu" ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; }; }; then
+                skip_install=1
+            fi
+        elif [[ -n "${HOST_PKG_FAMILY}" ]]; then
+            if host_pkg_is_installed "${_host_deps[@]}"; then
+                skip_install=1
             fi
         fi
     fi
 
     if [[ "$skip_install" -eq 1 ]]; then
-        echo "=====> Host dependencies already installed. Skipping APT update and installation."
+        echo "=====> Host dependencies already installed. Skipping ${HOST_PKG_MANAGER} update and installation."
     else
-        host_priv apt update
-        host_priv apt install -y "${_host_deps[@]}"
+        host_pkg_refresh
+        host_pkg_install "${_host_deps[@]}"
     fi
 
     if [[ "${ADVANCED_MODE:-0}" == "1" ]] && [[ -d "$WORKSPACE_CHROOT" ]]; then
@@ -1361,7 +1366,18 @@ function debootstrap() {
         return 0
     fi
     echo "=====> running debootstrap ... this will take a few minutes ..."
-    host_priv debootstrap --arch=amd64 --variant=minbase "$TARGET_UBUNTU_VERSION" "$WORKSPACE_CHROOT" "$TARGET_UBUNTU_MIRROR"
+    # On openSUSE, debootstrap is not packaged with the Ubuntu/Debian
+    # archive keyrings -- ensure the Ubuntu archive keyring is on the host
+    # and hand it to debootstrap explicitly via --keyring so it can verify
+    # the Ubuntu Release signature.
+    local -a _debootstrap_extra=()
+    if [[ "${HOST_PKG_FAMILY}" == "rpm" ]]; then
+        ensure_ubuntu_keyring_for_opensuse
+        _debootstrap_extra=(--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg)
+    fi
+    host_priv debootstrap --arch=amd64 --variant=minbase \
+        "${_debootstrap_extra[@]}" \
+        "$TARGET_UBUNTU_VERSION" "$WORKSPACE_CHROOT" "$TARGET_UBUNTU_MIRROR"
 }
 
 function run_chroot() {
