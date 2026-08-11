@@ -216,21 +216,74 @@ echo "=====> Selected: ${BUILD_DISTRO} / ${BUILD_OUTPUT} (scripts/${BUILD_SCRIPT
 # (which would otherwise re-install them) is a no-op. The dep list is
 # computed from BUILD_OUTPUT so the ISO-only tools (squashfs-tools, xorriso)
 # are not pulled in for img/vm runs and vice versa.
-IS_DEBIAN_OR_UBUNTU=0
+#
+# Three host families are supported here:
+#   deb   - Ubuntu / Debian and derivatives (apt + dpkg)
+#   rpm   - openSUSE / SUSE (zypper + rpm)
+#   arch  - Arch Linux and derivatives (pacman)
+# Any other host is left to the user to install dependencies for.
+HOST_PKG_FAMILY=""
+HOST_PKG_MANAGER=""
+# Per-family overrides for the host's package name. The key is
+# 'canonical:family' (e.g. 'xorriso:arch'); the value is the host's
+# package name on that family. Anything not listed here uses the
+# canonical (Debian-style) name as-is, which is the right answer for
+# most tools (debootstrap, parted, dosfstools, e2fsprogs, rsync, etc.).
+# Keep in sync with scripts/build.sh (same table for its own host-side
+# install path).
+declare -gA HOST_PKG_NAME=(
+    [squashfs-tools:rpm]=squashfs        # openSUSE: 'squashfs'
+    [xorriso:arch]=libisoburn            # Arch: xorriso binary ships in libisoburn
+    [qemu-utils:rpm]=qemu-tools          # openSUSE: 'qemu-tools'
+    [qemu-utils:arch]=qemu-img           # Arch: 'qemu-img'
+)
+
 IS_DEBIAN=0
 if [[ -r /etc/os-release ]]; then
     # shellcheck source=/dev/null
     . /etc/os-release
-    if [[ "${ID:-}" == "ubuntu" ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
-        IS_DEBIAN_OR_UBUNTU=1
-    elif [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; then
-        IS_DEBIAN_OR_UBUNTU=1
-        # Exclude Ubuntu-based distros (e.g. Linux Mint based on Ubuntu)
-        if [[ "${ID:-}" != "ubuntu" ]] && [[ "${ID_LIKE:-}" != *ubuntu* ]]; then
-            IS_DEBIAN=1
-        fi
+    case "${ID:-}" in
+        ubuntu)
+            HOST_PKG_FAMILY="deb"; HOST_PKG_MANAGER="apt" ;;
+        debian)
+            HOST_PKG_FAMILY="deb"; HOST_PKG_MANAGER="apt"
+            # Exclude Ubuntu-based distros (e.g. Linux Mint based on Ubuntu)
+            if [[ "${ID_LIKE:-}" != *ubuntu* ]]; then
+                IS_DEBIAN=1
+            fi
+            ;;
+        opensuse-tumbleweed|opensuse-slowroll)
+            # openSUSE Tumbleweed and openSUSE Slowroll are the supported
+            # openSUSE targets. openSUSE Leap is NOT currently planned --
+            # if you would like to add Leap support, contributions are
+            # welcome (open an issue or PR).
+            HOST_PKG_FAMILY="rpm"; HOST_PKG_MANAGER="zypper" ;;
+        arch)
+            HOST_PKG_FAMILY="arch"; HOST_PKG_MANAGER="pacman" ;;
+    esac
+    # ID_LIKE fallback for derivatives (Mint, Manjaro, Endeavour, ...).
+    if [[ -z "$HOST_PKG_FAMILY" ]]; then
+        case "${ID_LIKE:-}" in
+            *ubuntu*|*debian*)
+                HOST_PKG_FAMILY="deb"; HOST_PKG_MANAGER="apt" ;;
+            *suse*|*opensuse*)
+                HOST_PKG_FAMILY="rpm"; HOST_PKG_MANAGER="zypper" ;;
+            *arch*)
+                HOST_PKG_FAMILY="arch"; HOST_PKG_MANAGER="pacman" ;;
+        esac
     fi
 fi
+
+# Translate a canonical (Debian-style) package name to the host's name.
+shim_host_pkg_name() {
+    local canonical="$1"
+    local key="${canonical}:${HOST_PKG_FAMILY}"
+    if [[ -n "${HOST_PKG_NAME[$key]:-}" ]]; then
+        echo "${HOST_PKG_NAME[$key]}"
+        return
+    fi
+    echo "$canonical"
+}
 
 # Compute the dep list for the chosen output. debootstrap is always required;
 # ISO output needs squashfs-tools + xorriso; img + removable need
@@ -243,32 +296,62 @@ case "${BUILD_OUTPUT}" in
     removable) DEPS+=(parted dosfstools e2fsprogs rsync) ;;
 esac
 # On non-Ubuntu Debian, also pull the Ubuntu archive keyring so debootstrap
-# can verify Ubuntu release signatures.
+# can verify Ubuntu release signatures. No-op on non-deb hosts.
 if [[ "$IS_DEBIAN" -eq 1 ]]; then
     DEPS+=("ubuntu-archive-keyring")
 fi
 
 if [[ "$GENERATE_CONFIG" -eq 0 ]]; then
-    if [[ "$IS_DEBIAN_OR_UBUNTU" -eq 1 ]] && command -v dpkg &>/dev/null; then
+    if [[ -n "$HOST_PKG_FAMILY" ]]; then
+        # Translate the canonical dep list to the host's package names,
+        # then filter out the ones that are already installed.
         MISSING_DEPS=()
         for dep in "${DEPS[@]}"; do
-            if ! dpkg -s "$dep" &>/dev/null; then
-                MISSING_DEPS+=("$dep")
-            fi
+            host_name="$(shim_host_pkg_name "$dep")"
+            case "$HOST_PKG_FAMILY" in
+                deb)  dpkg -s "$host_name" &>/dev/null || MISSING_DEPS+=("$host_name") ;;
+                rpm)  rpm  -q "$host_name" &>/dev/null || MISSING_DEPS+=("$host_name") ;;
+                arch) pacman -Q "$host_name" &>/dev/null || MISSING_DEPS+=("$host_name") ;;
+            esac
         done
 
         if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
             echo "=====> Installing missing host dependencies: ${MISSING_DEPS[*]}"
-            if [ "$(id -u)" -eq 0 ]; then
-                apt-get update
-                apt-get install -y "${MISSING_DEPS[@]}"
-            else
-                sudo apt-get update
-                sudo apt-get install -y "${MISSING_DEPS[@]}"
-            fi
+            case "$HOST_PKG_FAMILY" in
+                deb)
+                    if [ "$(id -u)" -eq 0 ]; then
+                        apt-get update
+                        apt-get install -y "${MISSING_DEPS[@]}"
+                    else
+                        sudo apt-get update
+                        sudo apt-get install -y "${MISSING_DEPS[@]}"
+                    fi
+                    ;;
+                rpm)
+                    if [ "$(id -u)" -eq 0 ]; then
+                        zypper --non-interactive refresh
+                        zypper --non-interactive install "${MISSING_DEPS[@]}"
+                    else
+                        sudo zypper --non-interactive refresh
+                        sudo zypper --non-interactive install "${MISSING_DEPS[@]}"
+                    fi
+                    ;;
+                arch)
+                    if [ "$(id -u)" -eq 0 ]; then
+                        # -Sy, not -Syu: only refresh the package DB; never
+                        # run a full system upgrade from a build script.
+                        pacman -Sy
+                        pacman -S --noconfirm --needed "${MISSING_DEPS[@]}"
+                    else
+                        sudo pacman -Sy
+                        sudo pacman -S --noconfirm --needed "${MISSING_DEPS[@]}"
+                    fi
+                    ;;
+            esac
         fi
     else
-        echo "=====> WARNING: host is not detected as Debian or Ubuntu ($(lsb_release -id 2>/dev/null || echo unknown))." >&2
+        echo "=====> WARNING: host is not detected as Ubuntu, Debian, openSUSE/SUSE, or Arch" >&2
+        echo "=====>          ($(lsb_release -id 2>/dev/null || echo unknown))." >&2
         echo "=====>          Skipping automatic dependency install. Make sure these are present:" >&2
         printf '=====>            %s\n' "${DEPS[@]}" >&2
         echo "=====>          The build will fail mid-run if any are missing." >&2

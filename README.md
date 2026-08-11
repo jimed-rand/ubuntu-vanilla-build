@@ -318,7 +318,7 @@ graph TD
 ## Requirements
 
 ### System Requirements
-- **Host OS**: Ubuntu/Debian or derivative (automatically validated by the script).
+- **Host OS**: Ubuntu, Debian, openSUSE (Tumbleweed / Slowroll), or Arch Linux (and their common derivatives). The script auto-detects the host's package manager (`apt`/`dpkg`, `zypper`/`rpm`, or `pacman`) and translates dependencies accordingly. See [Host OS Compatibility](#host-os-compatibility) for the package-name differences.
 - **Internet Access**: Required for downloading packages from Ubuntu and third-party repositories.
 - **Disk Space**: Minimum 15-20 GB free space for debootstrap, squashfs, and ISO generation.
 - **RAM**: 4 GB minimum (8 GB recommended for smoother builds).
@@ -329,6 +329,41 @@ The script supports building on:
 - Ubuntu 22.04+ (jammy, noble, resolute)
 - Debian 11+ (requires `ubuntu-archive-keyring` package)
 - Ubuntu/Debian derivatives (Mint, Pop!_OS, etc.)
+- openSUSE Tumbleweed and openSUSE Slowroll
+  - *openSUSE Leap is not currently a planned target. If you would like to see it supported and are willing to help make sure it runs, contributions are very welcome -- please open an issue or PR.*
+- Arch Linux and derivatives (Manjaro, Endeavour, CachyOS, etc.)
+
+The host's package manager is auto-detected from `/etc/os-release`. Most dependencies use the same name across all three families (debootstrap, parted, dosfstools, e2fsprogs, rsync). The following tools have different package names depending on the host family:
+
+| Tool (canonical) | Ubuntu/Debian | openSUSE | Arch |
+| --- | --- | --- | --- |
+| squashfs | `squashfs-tools` | `squashfs` | `squashfs-tools` |
+| xorriso (ISO builder) | `xorriso` | `xorriso` | `libisoburn` |
+| qemu-utils / qemu-img | `qemu-utils` | `qemu-tools` | `qemu-img` |
+
+`start-here.sh` (and `scripts/build.sh` when run directly without the launcher) install the host dependencies for the chosen output type, using the host's own package manager. **The chroot is always Ubuntu** -- none of these host-side names affect the packages installed inside the chroot (those continue to use `apt-get`).
+
+---
+
+## Intended Use
+
+This project is designed for **interactive, personal-system builds** that you run directly on your own machine, with full manual control over the process. It is **not** designed for unattended CI/CD pipelines running on provider-hosted runners such as **GitHub-hosted Actions** or **GitLab-hosted CI**, which impose disk-space, execution-time, and permission limitations that this project was not built around.
+
+The build requires `sudo`, 15-20 GB of workspace, a full `debootstrap` pass, and direct interaction with the host system (chroot, mounts, partitioning). These requirements are not well-suited to ephemeral, provider-limited CI runners.
+
+### Self-hosted CI/CD exception
+
+Automated CI/CD usage is acceptable **if and only if** it runs on infrastructure you fully own and control — for example, a **self-hosted GitHub Actions runner** or a **self-hosted GitLab CI runner** on your own server. Self-hosted runners are not subject to the disk-space, execution-time, and permission constraints imposed by third-party-hosted runners, so the build can run there as designed.
+
+**Advanced Mode** (`--advanced --no-interactive --config=build.cfg`) is the intended way to automate builds in that self-hosted scenario. It runs the full pipeline non-interactively with a config file, while still requiring the same `sudo`, workspace, and host-system access as an interactive build.
+
+### Provider-hosted CI (GitHub Actions, etc.)
+
+If you want to build via provider-hosted GitHub Actions (or a similar hosted CI) despite the limitations described above, you are welcome to do so — but please **fork the repository** and modify the workflow and build scripts to fit your own needs. Do not expect upstream support for that use case; this project is intentionally not maintained for, and does not target, ephemeral provider-hosted CI environments.
+
+### General modifications
+
+If you want to modify the build for your personal needs in general, please **fork the repository** and make changes in your fork. This keeps the upstream project focused on its original design: a personal, interactive ISO builder run on a system the user controls.
 
 ---
 

@@ -188,6 +188,155 @@ HOST_CMD=(setup_host debootstrap run_chroot build_iso)
 # Chroot phase: APT setup, packages, /image layout, cleanup
 CHROOT_CMD=(chroot_prepare install_pkg build_image finish_up)
 
+# ---------------------------------------------------------------------------
+# Host (build-time, outside the chroot) package management abstraction.
+#
+# The chroot is always Ubuntu/Debian, so every apt-get call inside the
+# chroot pipeline stays as-is. This abstraction only covers commands that
+# run on the host *before* the chroot exists (setup_host's install of
+# debootstrap / squashfs-tools / xorriso, plus the skip-if-installed check
+# that guards it).
+#
+# Three host families are supported:
+#   deb   - Ubuntu / Debian and derivatives (uses apt + dpkg)
+#   rpm   - openSUSE / SUSE (uses zypper + rpm)
+#   arch  - Arch Linux and derivatives (uses pacman)
+#
+# Everything else calls host_pkg_install() / host_pkg_is_installed() with
+# the *canonical* (Debian-style) name; this layer translates it to the
+# host's package name and runs the host's package manager.
+# ---------------------------------------------------------------------------
+HOST_PKG_FAMILY=""
+HOST_PKG_MANAGER=""   # user-facing tool name: apt / zypper / pacman
+HOST_INSTALL_CMD=()   # array form of the install command (without pkgs)
+HOST_REFRESH_CMD=()   # array form of the DB-refresh command
+
+# Per-family overrides for the host's package name. The key is
+# 'canonical:family' (e.g. 'xorriso:arch'); the value is the host's
+# package name on that family. Anything not listed here uses the
+# canonical (Debian-style) name as-is, which is the right answer for
+# most tools (debootstrap, parted, dosfstools, e2fsprogs, rsync, etc.).
+declare -gA HOST_PKG_NAME=(
+    [squashfs-tools:rpm]=squashfs        # openSUSE: 'squashfs'
+    [xorriso:arch]=libisoburn            # Arch: xorriso binary ships in libisoburn
+    [qemu-utils:rpm]=qemu-tools          # openSUSE: 'qemu-tools'
+    [qemu-utils:arch]=qemu-img           # Arch: 'qemu-img'
+)
+
+# Lookup the host package name for a canonical (Debian) name on the current
+# host family. Falls back to the canonical name if no override is set.
+function host_pkg_name() {
+    local canonical="$1"
+    local key="${canonical}:${HOST_PKG_FAMILY}"
+    if [[ -n "${HOST_PKG_NAME[$key]:-}" ]]; then
+        echo "${HOST_PKG_NAME[$key]}"
+        return
+    fi
+    echo "$canonical"
+}
+
+# Detect the host's package family. Sets HOST_PKG_FAMILY / HOST_PKG_MANAGER
+# and HOST_INSTALL_CMD / HOST_REFRESH_CMD. Errors out on unsupported hosts.
+function host_pkg_detect() {
+    if [[ ! -r /etc/os-release ]]; then
+        >&2 echo "ERROR: /etc/os-release is missing or unreadable; cannot determine host package manager."
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    . /etc/os-release
+
+    local id="${ID:-}" id_like="${ID_LIKE:-}"
+
+    if [[ "$id" == "ubuntu" ]] || [[ "$id_like" == *ubuntu* ]] || \
+       [[ "$id" == "debian" ]] || [[ "$id_like" == *debian* ]]; then
+        HOST_PKG_FAMILY="deb"
+        HOST_PKG_MANAGER="apt"
+        HOST_INSTALL_CMD=(apt install -y)
+        HOST_REFRESH_CMD=(apt update)
+        return 0
+    fi
+
+    if [[ "$id" == "opensuse-tumbleweed" || "$id" == "opensuse-slowroll" || \
+          "$id_like" == *suse* || "$id_like" == *opensuse* ]]; then
+        # Supported openSUSE targets: Tumbleweed and Slowroll.
+        # openSUSE Leap / SLES are NOT currently planned -- contributions
+        # to add them are welcome.
+        HOST_PKG_FAMILY="rpm"
+        HOST_PKG_MANAGER="zypper"
+        HOST_INSTALL_CMD=(zypper --non-interactive install)
+        HOST_REFRESH_CMD=(zypper --non-interactive refresh)
+        return 0
+    fi
+
+    if [[ "$id" == "arch" || "$id_like" == *arch* ]]; then
+        HOST_PKG_FAMILY="arch"
+        HOST_PKG_MANAGER="pacman"
+        HOST_INSTALL_CMD=(pacman -S --noconfirm --needed)
+        # -Sy, not -Syu: only refresh the package DB; never run a full
+        # system upgrade from a build script -- that is the host owner's
+        # responsibility.
+        HOST_REFRESH_CMD=(pacman -Sy)
+        return 0
+    fi
+
+    >&2 echo "ERROR: Unsupported host OS (ID='${id}', ID_LIKE='${id_like}')."
+    >&2 echo "Supported host families: Ubuntu/Debian, openSUSE/SUSE, Arch."
+    exit 1
+}
+
+# host_pkg_refresh -- refresh the host's package database.
+# Wraps apt update / zypper refresh / pacman -Sy. No-op if the family
+# cannot be detected (caller will have already errored out by then).
+function host_pkg_refresh() {
+    if [[ ${#HOST_REFRESH_CMD[@]} -eq 0 ]]; then
+        return 0
+    fi
+    host_priv "${HOST_REFRESH_CMD[@]}"
+}
+
+# host_pkg_install PKG... -- install the given *canonical* (Debian-style)
+# package names on the host, translating to the host's name where needed.
+function host_pkg_install() {
+    if [[ ${#HOST_INSTALL_CMD[@]} -eq 0 ]]; then
+        return 0
+    fi
+    local -a host_pkgs=()
+    local p
+    for p in "$@"; do
+        host_pkgs+=("$(host_pkg_name "$p")")
+    done
+    host_priv "${HOST_INSTALL_CMD[@]}" "${host_pkgs[@]}"
+}
+
+# host_pkg_is_installed PKG... -- returns 0 iff every named canonical
+# package is installed on the host. Translates names per the host family.
+function host_pkg_is_installed() {
+    local p translated
+    case "$HOST_PKG_FAMILY" in
+        deb)
+            for p in "$@"; do
+                dpkg -s "$(host_pkg_name "$p")" &>/dev/null || return 1
+            done
+            ;;
+        rpm)
+            for p in "$@"; do
+                rpm -q "$(host_pkg_name "$p")" &>/dev/null || return 1
+            done
+            ;;
+        arch)
+            for p in "$@"; do
+                pacman -Q "$(host_pkg_name "$p")" &>/dev/null || return 1
+            done
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+
 # Run host commands as root: sudo when invoked as a normal user, direct exec when already root.
 function host_priv() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -1062,7 +1211,7 @@ function check_host_user() {
 
     if [[ ! -r /etc/os-release ]]; then
         >&2 echo "ERROR: /etc/os-release is missing or unreadable."
-        >&2 echo "This script must be run on Ubuntu (or an Ubuntu-based distribution) or on Debian (or a Debian-based distribution)."
+        >&2 echo "This script must be run on Ubuntu, Debian, openSUSE/SUSE, or Arch."
         exit 1
     fi
     # shellcheck source=/dev/null
@@ -1081,8 +1230,24 @@ function check_host_user() {
         return 0
     fi
 
+    # openSUSE / SUSE: debootstrap is in the main repos on Tumbleweed
+    # and Slowroll. zypper handles the rest.
+    # (openSUSE Leap and SLES are NOT currently planned targets --
+    # contributions to add them are welcome.)
+    if [[ "${ID:-}" == "opensuse-tumbleweed" || "${ID:-}" == "opensuse-slowroll" || \
+          "${ID_LIKE:-}" == *suse* || "${ID_LIKE:-}" == *opensuse* ]]; then
+        return 0
+    fi
+
+    # Arch Linux and derivatives (e.g. Manjaro, Endeavour): the host
+    # installer maps squashfs-tools -> squashfs, xorriso -> libisoburn,
+    # and qemu-utils -> qemu-img automatically; see HOST_PKG_NAME.
+    if [[ "${ID:-}" == "arch" || "${ID_LIKE:-}" == *arch* ]]; then
+        return 0
+    fi
+
     >&2 echo "ERROR: Unsupported host OS (ID='${ID:-unknown}', ID_LIKE='${ID_LIKE:-}')."
-    >&2 echo "Run this script only on Ubuntu or an Ubuntu-based system, or on Debian or a Debian-based system."
+    >&2 echo "Supported hosts: Ubuntu, Debian, openSUSE/SUSE, or Arch (and their derivatives)."
     exit 1
 }
 
@@ -1205,32 +1370,32 @@ function host_build_signal_trap() {
 function setup_host() {
     echo "=====> running setup_host ..."
 
+    # Canonical (Debian-style) host dependency names. The host-package
+    # abstraction in the preamble translates these to the host family's
+    # own package names (squashfs-tools -> squashfs on openSUSE,
+    # xorriso -> libisoburn on Arch, etc.).
+    local -a _host_deps=(debootstrap squashfs-tools xorriso)
+
     local skip_install=0
     if [[ "${LAUNCHED_FROM_START_HERE:-0}" -eq 1 ]]; then
-        if command -v dpkg &>/dev/null && [[ -r /etc/os-release ]]; then
-            local ID ID_LIKE
-            # shellcheck source=/dev/null
-            . /etc/os-release
-            if [[ "${ID:-}" == "ubuntu" ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]] || \
-               [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; then
-                if dpkg -s debootstrap squashfs-tools xorriso &>/dev/null; then
-                    skip_install=1
-                    if { [[ "${ID:-}" == "debian" ]] || [[ "${ID_LIKE:-}" == *debian* ]]; } && \
-                       { [[ "${ID:-}" != "ubuntu" ]] && [[ "${ID_LIKE:-}" != *ubuntu* ]]; }; then
-                        if ! dpkg -s ubuntu-archive-keyring &>/dev/null; then
-                            skip_install=0
-                        fi
-                    fi
-                fi
+        if [[ "${HOST_PKG_FAMILY}" == "deb" ]]; then
+            if host_pkg_is_installed "${_host_deps[@]}" \
+               && { ! host_pkg_is_installed ubuntu-archive-keyring || \
+                    { [[ "${ID:-}" == "ubuntu" ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; }; }; then
+                skip_install=1
+            fi
+        elif [[ -n "${HOST_PKG_FAMILY}" ]]; then
+            if host_pkg_is_installed "${_host_deps[@]}"; then
+                skip_install=1
             fi
         fi
     fi
 
     if [[ "$skip_install" -eq 1 ]]; then
-        echo "=====> Host dependencies already installed. Skipping APT update and installation."
+        echo "=====> Host dependencies already installed. Skipping ${HOST_PKG_MANAGER} update and installation."
     else
-        host_priv apt update
-        host_priv apt install -y debootstrap squashfs-tools xorriso
+        host_pkg_refresh
+        host_pkg_install "${_host_deps[@]}"
     fi
 
     if [[ "${ADVANCED_MODE:-0}" == "1" ]] && [[ -d "$WORKSPACE_CHROOT" ]]; then
@@ -2571,6 +2736,10 @@ function host_main() {
     local args=()
 
     set_defaults
+    # Detect the host's package family (deb / rpm / arch) and initialize
+    # the host_pkg_* helpers used by setup_host. Must run before any
+    # code path that touches host-side package management.
+    host_pkg_detect
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
