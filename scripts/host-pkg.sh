@@ -174,3 +174,12 @@ function ensure_ubuntu_keyring_for_opensuse() {
         --keyserver hkp://keyserver.ubuntu.com:80 \
         --recv-keys 871920D1991BC93C
 }
+# Arch debootstrap expects one architecture, while some Arch derivatives
+# return multiple values for `Architecture = auto`.
+function prepare_arch_pacman_conf() {
+    [[ "${HOST_PKG_FAMILY:-}" == "arch" ]] || return 0
+    if [[ ! -e /etc/pacman.conf.bkp ]]; then
+        host_priv cp -p /etc/pacman.conf /etc/pacman.conf.bkp
+    fi
+    host_priv sed -i -E 's/^[[:space:]]*Architecture[[:space:]]*=.*/Architecture = x86_64/' /etc/pacman.conf
+}

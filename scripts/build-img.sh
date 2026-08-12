@@ -1308,6 +1308,7 @@ function host_build_signal_trap() {
 
 function setup_host() {
     echo "=====> running setup_host ..."
+    prepare_arch_pacman_conf
 
     # Canonical (Debian-style) host dependency names. The host-package
     # abstraction (see host-pkg.sh) translates these to the host family's
@@ -1375,18 +1376,9 @@ function debootstrap() {
         ensure_ubuntu_keyring_for_opensuse
         _debootstrap_extra=(--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg)
     fi
-    local _debootstrap_path="${PATH}" _debootstrap_shim=""
-    if [[ "${HOST_PKG_FAMILY}" == "arch" ]] && command -v pacman-conf >/dev/null 2>&1 && [[ "$(pacman-conf Architecture 2>/dev/null)" == *[[:space:]]* ]]; then
-        _debootstrap_shim="$(mktemp -d "${TMPDIR:-/tmp}/debootstrap-path.XXXXXX")"
-        printf "%s\n" "#!/bin/sh" "exec /usr/bin/pacman-conf \"\$@\" | /usr/bin/head -n 1" >"${_debootstrap_shim}/pacman-conf"
-        chmod 0755 "${_debootstrap_shim}/pacman-conf"
-        export PATH="${_debootstrap_shim}:${PATH}"
-    fi
-    host_priv env "PATH=${PATH}" debootstrap --arch=amd64 --variant=minbase \
+    host_priv debootstrap --arch=amd64 --variant=minbase \
         "${_debootstrap_extra[@]}" \
         "$TARGET_UBUNTU_VERSION" "$WORKSPACE_CHROOT" "$TARGET_UBUNTU_MIRROR"
-    PATH="${_debootstrap_path}"
-    [[ -n "${_debootstrap_shim}" ]] && rm -rf "${_debootstrap_shim}"
 }
 
 function run_chroot() {
@@ -1399,6 +1391,7 @@ function run_chroot() {
     mount_package_cache
 
     host_priv cp "$SCRIPT_DIR/$SCRIPT_NAME" "$WORKSPACE_CHROOT/root/build.sh"
+    host_priv cp "$SCRIPT_DIR/host-pkg.sh" "$WORKSPACE_CHROOT/root/host-pkg.sh"
 
     # Copy hooks into chroot so chroot-phase hooks can run inside.
     host_priv rm -rf "$WORKSPACE_CHROOT/root/hooks"
@@ -1440,6 +1433,7 @@ function run_chroot() {
         /root/build.sh --chroot-internal -
 
     host_priv rm -f "$WORKSPACE_CHROOT/root/build.sh"
+    host_priv rm -f "$WORKSPACE_CHROOT/root/host-pkg.sh"
     host_priv rm -rf "$WORKSPACE_CHROOT/root/hooks"
 
     unmount_package_cache
@@ -1746,6 +1740,7 @@ function build_disk_image() {
     echo "=====> copying the root filesystem into the image ..."
     host_priv rsync -aHAX \
         --exclude=/root/build.sh \
+        --exclude=/root/host-pkg.sh \
         --exclude=/root/hooks \
         --exclude='/var/cache/apt/archives/*.deb' \
         --exclude=/swapfile \

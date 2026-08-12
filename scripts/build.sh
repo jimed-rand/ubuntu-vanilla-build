@@ -1204,6 +1204,7 @@ function host_build_signal_trap() {
 
 function setup_host() {
     echo "=====> running setup_host ..."
+    prepare_arch_pacman_conf
 
     # Canonical (Debian-style) host dependency names. The host-package
     # abstraction in the preamble translates these to the host family's
@@ -1273,20 +1274,9 @@ function debootstrap() {
     # "x86_64 x86_64_v2"); debootstrap only accepts the first Arch value.
     # Keep the workaround local to this invocation instead of modifying the
     # user's pacman.conf.  The target architecture remains Debian's amd64.
-    local _debootstrap_path="${PATH}"
-    local _debootstrap_shim=""
-    if [[ "${HOST_PKG_FAMILY}" == "arch" ]] && command -v pacman-conf >/dev/null 2>&1 \
-       && [[ "$(pacman-conf Architecture 2>/dev/null)" == *[[:space:]]* ]]; then
-        _debootstrap_shim="$(mktemp -d "${TMPDIR:-/tmp}/debootstrap-path.XXXXXX")"
-        printf '%s\n' '#!/bin/sh' 'exec /usr/bin/pacman-conf "$@" | /usr/bin/head -n 1' >"${_debootstrap_shim}/pacman-conf"
-        chmod 0755 "${_debootstrap_shim}/pacman-conf"
-        export PATH="${_debootstrap_shim}:${PATH}"
-    fi
-    host_priv env "PATH=${PATH}" debootstrap --arch=amd64 --variant=minbase \
+    host_priv debootstrap --arch=amd64 --variant=minbase \
         "${_debootstrap_extra[@]}" \
         "$TARGET_UBUNTU_VERSION" "$WORKSPACE_CHROOT" "$TARGET_UBUNTU_MIRROR"
-    PATH="${_debootstrap_path}"
-    [[ -n "${_debootstrap_shim}" ]] && rm -rf "${_debootstrap_shim}"
 }
 
 function run_chroot() {
@@ -1299,6 +1289,7 @@ function run_chroot() {
     mount_package_cache
 
     host_priv cp "$SCRIPT_DIR/build.sh" "$WORKSPACE_CHROOT/root/build.sh"
+    host_priv cp "$SCRIPT_DIR/host-pkg.sh" "$WORKSPACE_CHROOT/root/host-pkg.sh"
     host_priv rm -rf "$WORKSPACE_CHROOT/root/calamares-config"
     if [[ -d "$SCRIPT_DIR/calamares" ]]; then
         host_priv cp -a "$SCRIPT_DIR/calamares" "$WORKSPACE_CHROOT/root/calamares-config"
@@ -1344,6 +1335,7 @@ function run_chroot() {
         /root/build.sh --chroot-internal -
 
     host_priv rm -f "$WORKSPACE_CHROOT/root/build.sh"
+    host_priv rm -f "$WORKSPACE_CHROOT/root/host-pkg.sh"
     host_priv rm -rf "$WORKSPACE_CHROOT/root/calamares-config"
     host_priv rm -rf "$WORKSPACE_CHROOT/root/hooks"
 
