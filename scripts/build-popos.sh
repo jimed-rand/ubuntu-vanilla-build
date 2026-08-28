@@ -421,7 +421,9 @@ function default_target_name() {
     local version desktop
     version="$(release_version "${TARGET_UBUNTU_VERSION:-}")"
     desktop="${TARGET_DESKTOP:-gnome}"
-    if [[ "$desktop" == "none" ]]; then
+    if [[ "${TARGET_PROFILE:-}" == "minimal" ]] || [[ "$desktop" == "minimal" || "$desktop" == "really-minimal" ]]; then
+        desktop="minimal"
+    elif [[ "$desktop" == "none" || "${TARGET_PROFILE:-}" == "server" ]]; then
         # The "none" profile produces a server ISO; "server" reads better
         # in the filename than "none".
         desktop="server"
@@ -430,26 +432,41 @@ function default_target_name() {
 }
 
 function normalize_desktop_variant() {
-    local desktop="${TARGET_DESKTOP:-gnome}"
+    local desktop="${TARGET_DESKTOP:-}"
     desktop="${desktop,,}"
     case "$desktop" in
         kde)
             desktop="kde-plasma"
             ;;
-        # "No Desktop" / server / minimal profile: produces a TTY-only ISO
-        # that uses scripts/cli-installer/install-system as its installer.
-        none|server|cli|headless|minimal)
+        server)
+            export TARGET_PROFILE="${TARGET_PROFILE:-server}"
             desktop="none"
+            ;;
+        minimal|really-minimal)
+            export TARGET_PROFILE="${TARGET_PROFILE:-minimal}"
+            desktop="none"
+            ;;
+        none|cli|headless)
+            export TARGET_PROFILE="${TARGET_PROFILE:-server}"
+            desktop="none"
+            ;;
+        "")
+            ;;
+        *)
+            export TARGET_PROFILE="${TARGET_PROFILE:-desktop}"
             ;;
     esac
     # The "none" profile is special-cased above; the regex check below only
     # applies to the eight graphical desktop slugs.
+    if [[ -z "$desktop" ]]; then
+        return 0
+    fi
     if [[ "$desktop" == "none" ]]; then
         export TARGET_DESKTOP="none"
         return 0
     fi
     if [[ ! "$desktop" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-        >&2 echo "TARGET_DESKTOP must be a slug like gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, kde-plasma, or one of: none, server, cli, headless, minimal (got: '${TARGET_DESKTOP:-}')."
+        >&2 echo "TARGET_DESKTOP must be a slug like gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, kde-plasma, or one of: none, server, minimal, really-minimal, cli, headless (got: '${TARGET_DESKTOP:-}')."
         exit 1
     fi
     export TARGET_DESKTOP="$desktop"
@@ -1057,6 +1074,106 @@ EOF
         if [[ ${#_purge_slideshow[@]} -gt 0 ]]; then
             apt-get purge -y "${_purge_slideshow[@]}"
         fi
+    elif [[ "${TARGET_PROFILE:-server}" == "minimal" ]]; then
+        # -----------------------------------------------------------------
+        # Really Minimal ISO post-install.
+        # -----------------------------------------------------------------
+        # Base system only:
+        #   * Core utilities: curl, wget, ca-certificates, gnupg, git, vim, nano, less
+        #   * Vendor repositories & keyrings configured (Brave, LibreWolf, Mozilla)
+        #     without pre-installing the software packages
+        #   * Core Flatpak + Flathub repo configured (no GNOME/KDE software plugin)
+        #   * Pacstall package manager (if selected)
+        #   * No Plymouth, no browsers pre-installed, no server services forced
+        # -----------------------------------------------------------------
+        echo "=====> Really Minimal ISO: base system setup"
+        apt-get install -y curl wget apt-transport-https ca-certificates squashfs-tools gnupg software-properties-common git vim nano less
+
+        install -d /usr/share/keyrings /etc/apt/sources.list.d /etc/apt/preferences.d
+
+        echo "=====> Configuring vendor APT repositories (Brave, LibreWolf, Mozilla) without pre-installing packages"
+        curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg \
+            https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+        curl -fsSLo /etc/apt/sources.list.d/brave-browser-release.sources \
+            https://brave-browser-apt-release.s3.brave.com/brave-browser.sources
+
+        curl -fsSL https://repo.librewolf.net/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/librewolf.gpg
+        printf '%s\n' \
+            "deb [arch=amd64 signed-by=/usr/share/keyrings/librewolf.gpg] https://repo.librewolf.net/ librewolf main" \
+            > /etc/apt/sources.list.d/librewolf.list
+
+        wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- \
+            > /usr/share/keyrings/packages.mozilla.org.asc
+        printf '%s\n' \
+            "deb [signed-by=/usr/share/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+            > /etc/apt/sources.list.d/mozilla.list
+        add-apt-repository ppa:mozillateam/ppa -y
+        cat <<'EOF' > /etc/apt/preferences.d/mozilla
+Package: *
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000
+
+Package: firefox
+Pin: release o=Ubuntu
+Pin-Priority: -1
+
+Package: firefox
+Pin: origin ppa.launchpadcontent.net
+Pin-Priority: -1
+
+Package: firefox-esr
+Pin: origin ppa.launchpadcontent.net
+Pin-Priority: 1000
+
+Package: thunderbird
+Pin: origin ppa.launchpadcontent.net
+Pin-Priority: 1000
+EOF
+
+        apt-get update
+
+        echo "=====> Flatpak: installing core flatpak and enabling Flathub (no desktop plugin)"
+        apt-get install -y flatpak
+        flatpak remote-add --if-not-exists --system flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+
+        if [[ "${TARGET_PACSTALL:-1}" == "1" ]]; then
+            echo "=====> Pacstall (official installer from https://pacstall.dev/q/install)"
+            local _pacstall_installer="/tmp/pacstall-install.sh"
+            curl -fsSL https://pacstall.dev/q/install -o "$_pacstall_installer"
+            (
+                export DEBIAN_FRONTEND=noninteractive
+                printf 'n\n' | env GITHUB_ACTIONS=true bash -e "$_pacstall_installer"
+            )
+            rm -f "$_pacstall_installer"
+        else
+            echo "=====> Pacstall: skipped"
+        fi
+
+        if [[ "${TARGET_SYSTEM76_DRIVER:-0}" == "1" ]]; then
+            echo "=====> System76 hardware driver: system76-driver (from the Pop!_OS repos)"
+            apt-get install -y system76-driver
+            if [[ -f /etc/apt/preferences.d/pop-default-settings ]]; then
+                cat <<'EOF' > /etc/apt/preferences.d/pop-default-settings
+# Blanket "Package: *" pin removed by build-popos.sh
+EOF
+            fi
+        fi
+
+        # First-boot hint: tell the user about install-system
+        cat <<'EOF' > /etc/systemd/system/uvb-cli-installer-hint.service
+[Unit]
+Description=Show CLI installer hint on tty1 (one-shot, minimal ISO only)
+After=multi-user.target
+ConditionPathExists=!/var/lib/uvb-cli-installer-hint.shown
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'printf "\n  *** Pop!_OS Minimal ISO ***\n  Run \x27sudo install-system\x27 to install from this live environment.\n  See /usr/local/bin/install-system --help for details.\n\n" > /dev/console || true'
+ExecStartPost=/bin/touch /var/lib/uvb-cli-installer-hint.shown
+RemainAfterExit=yes
+EOF
+        systemctl enable uvb-cli-installer-hint.service
     else
         # -----------------------------------------------------------------
         # Server / minimal ISO post-install.
@@ -1875,61 +1992,99 @@ function resolve_kernel_choice() {
     exit 1
 }
 
+function interactive_iso_type_pick() {
+    if ! prompts_enabled; then
+        ui_err "No terminal is available. Use --desktop=<desktop> or --desktop=server|minimal."
+        exit 1
+    fi
+
+    ui_heading "ISO Profile"
+    echo "    1) Desktop         Graphical desktop system (GNOME, XFCE, KDE, MATE, etc.) [default]"
+    echo "    2) Server          Headless server with standard server utilities (CLI installer)"
+    echo "    3) Really Minimal  Base system only (Kernel, firmware, base packages, CLI installer)"
+
+    local choice
+    while true; do
+        read -r -p "  Profile [1/2/3, Enter=1]: " choice
+        case "${choice,,}" in
+            ""|1|d|desktop)
+                export TARGET_PROFILE="desktop"
+                break
+                ;;
+            2|s|server)
+                export TARGET_PROFILE="server"
+                export TARGET_DESKTOP="none"
+                export TARGET_INSTALLER="cli-installer"
+                break
+                ;;
+            3|m|minimal|really-minimal)
+                export TARGET_PROFILE="minimal"
+                export TARGET_DESKTOP="none"
+                export TARGET_INSTALLER="cli-installer"
+                break
+                ;;
+            *) ui_warn "Invalid selection: '$choice'." ;;
+        esac
+    done
+    ui_ok "TARGET_PROFILE=$TARGET_PROFILE"
+}
+
 function interactive_desktop_pick() {
     if ! prompts_enabled; then
-        ui_err "No terminal is available. Use --desktop=<desktop> (e.g. gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, kde-plasma, none)."
+        ui_err "No terminal is available. Use --desktop=<desktop> (e.g. gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, kde-plasma)."
         exit 1
     fi
 
     ui_heading "Desktop environment"
     echo "    (Ordered A-Z by desktop name. Pop's own desktops -- pop-desktop and COSMIC --"
-    echo "     are intentionally NOT offered here; see the COSMIC note at the end of the build."
-    echo "     Pick 'None' for a server / minimal ISO.)"
-    echo "    1) <None>        Server / minimal: TTY-only ISO that ships"
-    echo "                     scripts/cli-installer/install-system as the installer."
-    echo "                     No desktop, no display manager, no Flatpak. Pre-installs"
-    echo "                     openssh-server + the 'standard system utilities' set."
-    echo "                     Use this for headless servers, VMs, and very small ISOs."
-    echo "    2) Budgie         Modern GTK desktop with Raven applets/sidebar. budgie-desktop-environment; lightdm + slick-greeter."
-    echo "    3) Cinnamon       Familiar bottom panel and menu layout. cinnamon-desktop-environment; lightdm + slick-greeter."
-    echo "    4) GNOME          Modern, full-featured desktop (similar to stock Ubuntu). Installs vanilla-gnome-desktop; next prompt offers optional extra apps (APT recommends)."
-    echo "    5) KDE            KDE Plasma - flexible and customizable. Next you choose package set: kde-full, kde-standard, or kde-plasma-desktop."
-    echo "    6) LXDE           Very light; best for low-spec or older PCs. lxde metapackage; lightdm + slick-greeter (classic LXDE stack)."
-    echo "    7) LXQt           Lightweight Qt desktop. lxqt + sddm + xorg (no Lubuntu branding metapackages)."
-    echo "    8) MATE           Traditional two-panel layout (GNOME 2 style). You choose full vs core MATE metapackage next, then optional extras."
-    echo "    9) XFCE           Lighter weight, classic taskbar layout. xfce4 + add-ons; display manager lightdm + slick-greeter; includes labwc for an optional Wayland session."
+    echo "     are intentionally NOT offered here; see the COSMIC note at the end of the build.)"
+    echo "    1) Budgie         Modern GTK desktop with Raven applets/sidebar. budgie-desktop-environment; lightdm + slick-greeter."
+    echo "    2) Cinnamon       Familiar bottom panel and menu layout. cinnamon-desktop-environment; lightdm + slick-greeter."
+    echo "    3) GNOME          Modern, full-featured desktop (similar to stock Ubuntu). Installs vanilla-gnome-desktop; next prompt offers optional extra apps (APT recommends)."
+    echo "    4) KDE            KDE Plasma - flexible and customizable. Next you choose package set: kde-full, kde-standard, or kde-plasma-desktop."
+    echo "    5) LXDE           Very light; best for low-spec or older PCs. lxde metapackage; lightdm + slick-greeter (classic LXDE stack)."
+    echo "    6) LXQt           Lightweight Qt desktop. lxqt + sddm + xorg (no Lubuntu branding metapackages)."
+    echo "    7) MATE           Traditional two-panel layout (GNOME 2 style). You choose full vs core MATE metapackage next, then optional extras."
+    echo "    8) XFCE           Lighter weight, classic taskbar layout. xfce4 + add-ons; display manager lightdm + slick-greeter; includes labwc for an optional Wayland session."
 
     local choice
     while true; do
-        read -r -p "  Desktop [1-9, A-Z by name; Enter=GNOME]: " choice
+        read -r -p "  Desktop [1-8, A-Z by name; Enter=GNOME]: " choice
         case "${choice,,}" in
-            ""|4|g|gnome)               export TARGET_DESKTOP="gnome";   break ;;
-            1|n|none|no-desktop|server|cli|headless|minimal)
-                                         export TARGET_DESKTOP="none";    break ;;
-            2|b|budgie)                 export TARGET_DESKTOP="budgie";   break ;;
-            3|c|cinnamon)               export TARGET_DESKTOP="cinnamon"; break ;;
-            5|k|kde|kde-plasma)         export TARGET_DESKTOP="kde-plasma"; break ;;
-            6|l|lxde)                   export TARGET_DESKTOP="lxde";    break ;;
-            7|q|lxqt)                   export TARGET_DESKTOP="lxqt";    break ;;
-            8|m|mate)                   export TARGET_DESKTOP="mate";    break ;;
-            9|x|xfce)                   export TARGET_DESKTOP="xfce";    break ;;
+            ""|3|g|gnome)               export TARGET_DESKTOP="gnome";   break ;;
+            1|b|budgie)                 export TARGET_DESKTOP="budgie";   break ;;
+            2|c|cinnamon)               export TARGET_DESKTOP="cinnamon"; break ;;
+            4|k|kde|kde-plasma)         export TARGET_DESKTOP="kde-plasma"; break ;;
+            5|l|lxde)                   export TARGET_DESKTOP="lxde";    break ;;
+            6|q|lxqt)                   export TARGET_DESKTOP="lxqt";    break ;;
+            7|m|mate)                   export TARGET_DESKTOP="mate";    break ;;
+            8|x|xfce)                   export TARGET_DESKTOP="xfce";    break ;;
             *) ui_warn "Invalid selection: '$choice'." ;;
         esac
     done
     ui_ok "TARGET_DESKTOP=$TARGET_DESKTOP"
 }
 
-function resolve_desktop_choice() {
+function resolve_iso_profile_and_desktop() {
     if [[ -n "${TARGET_DESKTOP:-}" ]]; then
+        normalize_desktop_variant
         return 0
     fi
 
     if prompts_enabled; then
-        interactive_desktop_pick
+        interactive_iso_type_pick
+        if [[ "${TARGET_PROFILE:-desktop}" == "desktop" ]]; then
+            interactive_desktop_pick
+        fi
         return 0
     fi
 
     export TARGET_DESKTOP=gnome
+    export TARGET_PROFILE="desktop"
+}
+
+function resolve_desktop_choice() {
+    resolve_iso_profile_and_desktop
 }
 
 function interactive_kde_package_pick() {
@@ -2087,202 +2242,16 @@ function resolve_gnome_recommends_choice() {
     export TARGET_GNOME_INSTALL_RECOMMENDS=0
 }
 
-function interactive_brave_channel_pick() {
-    if ! prompts_enabled; then
-        ui_err "No terminal is available. Set TARGET_BRAVE_CHANNEL=none|release|origin (or legacy TARGET_BROWSER=release|origin)."
-        exit 1
-    fi
-
-    ui_heading "Brave Browser"
-    echo "    1) Brave Stable [default]"
-    echo "       Official release from Brave's repository (brave-browser package)"
-    echo "       This is the standard Brave browser with all features enabled by default"
-    echo "       Includes Leo AI, News, Playlist, Rewards, Wallet, VPN, and other integrated features"
-    echo "       Completely free to use on all platforms with regular security updates"
-    echo ""
-    echo "    2) Brave Origin"
-    echo "       Origin build (brave-origin package) - a minimalist version of Brave"
-    echo "       Streamlined to the core of Brave's ad blocking and privacy protections"
-    echo "       Lets you manage or completely remove features you don't want"
-    echo "       Removes daily usage pings, crash logs, and product analytics"
-    echo "       FREE for Linux users (paid on other platforms)"
-    echo "       Ideal for users who want a clean, privacy-focused browser without extra features"
-    echo ""
-    echo "    3) Skip Brave"
-    echo "       Do not install Brave browser"
-    echo "       Choose this if you prefer another browser or don't need Brave"
-    echo ""
-
-    local choice
-    while true; do
-        read -r -p "  Brave [1/2/3, Enter=1]: " choice
-        case "${choice,,}" in
-            ""|1|r|release|stable)
-                export TARGET_BRAVE_CHANNEL="release"
-                break
-                ;;
-            2|o|origin)
-                export TARGET_BRAVE_CHANNEL="origin"
-                break
-                ;;
-            3|n|none|skip)
-                export TARGET_BRAVE_CHANNEL="none"
-                break
-                ;;
-            *) ui_warn "Invalid selection: '$choice'." ;;
-        esac
-    done
-    ui_ok "TARGET_BRAVE_CHANNEL=$TARGET_BRAVE_CHANNEL"
-}
-
-# interactive_toggle_pick VAR_NAME HEADING INSTALL_LABEL SKIP_LABEL PROMPT_LABEL
-#   Generic yes/no pre-install toggle. Default answer is "skip" (0).
-function interactive_toggle_pick() {
-    local var_name="$1" heading="$2" install_label="$3" skip_label="$4" prompt_label="$5"
-
-    if ! prompts_enabled; then
-        ui_err "No terminal is available. Set ${var_name}=0|1."
-        exit 1
-    fi
-
-    ui_heading "$heading"
-    echo "    1) ${install_label}"
-    echo "    2) ${skip_label}  [default]"
-
-    local choice
-    while true; do
-        read -r -p "  ${prompt_label} [1/2, Enter=2]: " choice
-        case "${choice,,}" in
-            ""|2|n|no|off|skip|s|none)
-                export "$var_name"="0"
-                break
-                ;;
-            1|y|yes|install|pre|on)
-                export "$var_name"="1"
-                break
-                ;;
-            *) ui_warn "Invalid selection: '$choice'." ;;
-        esac
-    done
-    ui_ok "${var_name}=${!var_name}"
-}
-
-function interactive_librewolf_pick() {
-    interactive_toggle_pick TARGET_LIBREWOLF \
-        "Librewolf" \
-        "Pre-install librewolf (repo is configured either way)" \
-        "Skip Librewolf" \
-        "Librewolf"
-}
-
-function interactive_firefox_pick() {
-    if ! prompts_enabled; then
-        ui_err "No terminal is available. Set TARGET_FIREFOX=0|1, TARGET_FIREFOX_ESR=0|1 and TARGET_FIREFOX_POPOS=0|1."
-        exit 1
-    fi
-
-    ui_heading "Firefox Browser"
-    echo "    1) Firefox Release (Mozilla APT)"
-    echo "       Official release from Mozilla's repository (firefox package)"
-    echo "       This is the standard Firefox browser with the latest features"
-    echo "       Includes the newest web standards, performance improvements, and UI updates"
-    echo "       Rapid release cycle with major updates every 4 weeks"
-    echo "       Ideal for users who want cutting-edge features and the latest security patches"
-    echo ""
-    echo "    2) Firefox ESR"
-    echo "       Extended Support Release (firefox-esr package) from Mozilla PPA"
-    echo "       A slower-moving release designed for enterprise and institutional use"
-    echo "       Receives security updates but fewer feature changes over time"
-    echo "       Major updates only once per year, with maintenance updates for 54 weeks"
-    echo "       Ideal for users who prefer stability and consistency over new features"
-    echo "       Recommended for organizations that need standardized browser environments"
-    echo ""
-    echo "    3) Firefox from the Pop!_OS repository"
-    echo "       The native deb System76 builds from Mozilla source (pop-os/packaging-firefox)"
-    echo "       Same firefox package stock Pop!_OS ships -- a real browser, NOT Ubuntu's"
-    echo "       snap-transition stub; verified at install time (deb > 10 MB, no snapd dependency)"
-    echo "       Updates arrive through the Pop!_OS release repository together with the system"
-    echo "       Ideal if you want the browser exactly as Pop!_OS ships it"
-    echo ""
-    echo "    4) Skip Firefox [default]"
-    echo "       Do not install Firefox browser"
-    echo "       Choose this if you prefer another browser or don't need Firefox"
-    echo ""
-
-    local choice
-    while true; do
-        read -r -p "  Firefox [1/2/3/4, Enter=4]: " choice
-        case "${choice,,}" in
-            1|r|release)
-                export TARGET_FIREFOX="1"
-                export TARGET_FIREFOX_ESR="0"
-                export TARGET_FIREFOX_POPOS="0"
-                break
-                ;;
-            2|e|esr)
-                export TARGET_FIREFOX="0"
-                export TARGET_FIREFOX_ESR="1"
-                export TARGET_FIREFOX_POPOS="0"
-                break
-                ;;
-            3|p|pop|popos|pop-os)
-                export TARGET_FIREFOX="0"
-                export TARGET_FIREFOX_ESR="0"
-                export TARGET_FIREFOX_POPOS="1"
-                break
-                ;;
-            ""|4|n|none|skip)
-                export TARGET_FIREFOX="0"
-                export TARGET_FIREFOX_ESR="0"
-                export TARGET_FIREFOX_POPOS="0"
-                break
-                ;;
-            *) ui_warn "Invalid selection: '$choice'." ;;
-        esac
-    done
-    ui_ok "TARGET_FIREFOX=$TARGET_FIREFOX  TARGET_FIREFOX_ESR=$TARGET_FIREFOX_ESR  TARGET_FIREFOX_POPOS=$TARGET_FIREFOX_POPOS"
-}
-
-function interactive_thunderbird_pick() {
-    interactive_toggle_pick TARGET_THUNDERBIRD \
-        "Thunderbird (Mozilla PPA)" \
-        "Pre-install thunderbird (Mozilla PPA + pin are configured either way)" \
-        "Skip Thunderbird" \
-        "Thunderbird"
-}
-
 function resolve_browser_selection() {
     if [[ -n "${TARGET_BROWSER:-}" && -z "${TARGET_BRAVE_CHANNEL:-}" ]]; then
         export TARGET_BRAVE_CHANNEL="$TARGET_BROWSER"
     fi
 
     if [[ -z "${TARGET_BRAVE_CHANNEL:-}" ]]; then
-        if prompts_enabled; then
-            interactive_brave_channel_pick
+        if [[ "${TARGET_DESKTOP:-gnome}" == "none" ]]; then
+            export TARGET_BRAVE_CHANNEL="none"
         else
             export TARGET_BRAVE_CHANNEL="release"
-        fi
-    fi
-
-    if [[ -z "${TARGET_LIBREWOLF+x}" ]]; then
-        if prompts_enabled; then
-            interactive_librewolf_pick
-        else
-            export TARGET_LIBREWOLF="0"
-        fi
-    fi
-
-    if [[ -z "${TARGET_FIREFOX+x}" && -z "${TARGET_FIREFOX_ESR+x}" && -z "${TARGET_FIREFOX_POPOS+x}" ]]; then
-        if prompts_enabled; then
-            interactive_firefox_pick
-        fi
-    fi
-
-    if [[ -z "${TARGET_THUNDERBIRD+x}" ]]; then
-        if prompts_enabled; then
-            interactive_thunderbird_pick
-        else
-            export TARGET_THUNDERBIRD="0"
         fi
     fi
 
@@ -2294,38 +2263,7 @@ function resolve_browser_selection() {
 }
 
 function resolve_ubuntu_studio_choice() {
-    if [[ -n "${TARGET_UBUNTU_STUDIO+x}" ]]; then
-        export TARGET_UBUNTU_STUDIO="${TARGET_UBUNTU_STUDIO:-0}"
-        return 0
-    fi
-
-    if prompts_enabled; then
-        ui_heading "Ubuntu Studio"
-        echo "    Large bundle: ubuntustudio-audio/graphics/photography/publishing/video,"
-        echo "    ubuntustudio-wallpapers, ubuntustudio-menu, ubuntu-edu-music."
-        local yn
-        while true; do
-            read -r -p "  Do you want to install Ubuntu Studio packages? (y/N) " yn
-            yn="${yn,,}"
-            [[ -z "$yn" ]] && yn="n"
-            case "$yn" in
-                y|yes)
-                    export TARGET_UBUNTU_STUDIO="1"
-                    break
-                    ;;
-                n|no)
-                    export TARGET_UBUNTU_STUDIO="0"
-                    break
-                    ;;
-                *)
-                    echo "  Please answer y or n."
-                    ;;
-            esac
-        done
-        ui_ok "TARGET_UBUNTU_STUDIO=$TARGET_UBUNTU_STUDIO"
-    else
-        export TARGET_UBUNTU_STUDIO=0
-    fi
+    export TARGET_UBUNTU_STUDIO="${TARGET_UBUNTU_STUDIO:-0}"
 }
 
 function resolve_pacstall_choice() {
@@ -2366,6 +2304,11 @@ function resolve_pacstall_choice() {
 # keyboard/suspend support and system76-power. Only useful on System76
 # machines; default is to skip.
 function resolve_system76_driver_choice() {
+    if [[ "${TARGET_PROFILE:-desktop}" == "minimal" ]]; then
+        export TARGET_SYSTEM76_DRIVER="${TARGET_SYSTEM76_DRIVER:-0}"
+        return 0
+    fi
+
     if [[ -n "${TARGET_SYSTEM76_DRIVER+x}" ]]; then
         export TARGET_SYSTEM76_DRIVER="${TARGET_SYSTEM76_DRIVER:-0}"
         return 0
@@ -2383,8 +2326,65 @@ function resolve_system76_driver_choice() {
 }
 
 # Optional service/tool pre-installs: fwupd, OpenSSH server, Cockpit.
-# All default to "no" -- the point is a lean image where the user opts in.
 function resolve_optional_service_choices() {
+    if [[ "${TARGET_PROFILE:-server}" == "minimal" ]]; then
+        export TARGET_FWUPD="${TARGET_FWUPD:-0}"
+        export TARGET_OPENSSH_SERVER="${TARGET_OPENSSH_SERVER:-0}"
+        export TARGET_COCKPIT="${TARGET_COCKPIT:-0}"
+        return 0
+    fi
+
+    if [[ "${TARGET_PROFILE:-desktop}" == "server" ]]; then
+        if [[ -z "${TARGET_OPENSSH_SERVER+x}" ]]; then
+            if prompts_enabled; then
+                ui_heading "OpenSSH server"
+                echo "    Enable remote SSH access out of the box."
+                if ui_confirm "Pre-install OpenSSH server?" y; then
+                    export TARGET_OPENSSH_SERVER=1
+                else
+                    export TARGET_OPENSSH_SERVER=0
+                fi
+                ui_ok "TARGET_OPENSSH_SERVER=$TARGET_OPENSSH_SERVER"
+            else
+                export TARGET_OPENSSH_SERVER=1
+            fi
+        fi
+
+        if [[ -z "${TARGET_COCKPIT+x}" ]]; then
+            if prompts_enabled; then
+                interactive_toggle_pick TARGET_COCKPIT \
+                    "Cockpit (web admin console, from ${TARGET_UBUNTU_VERSION:-release}-backports)" \
+                    "Pre-install cockpit from the backports pocket" \
+                    "Skip Cockpit" \
+                    "Cockpit"
+            else
+                export TARGET_COCKPIT=0
+            fi
+        fi
+
+        if [[ -z "${TARGET_FWUPD+x}" ]]; then
+            if prompts_enabled; then
+                ui_heading "fwupd (firmware updater)"
+                echo "    fwupd is banned while the ISO is built, so no package can drag it in."
+                echo "    You can still pre-install it here as the very last build step, or add it"
+                echo "    yourself later on the installed system with 'sudo apt install fwupd'."
+                if ui_confirm "Pre-install fwupd?" n; then
+                    export TARGET_FWUPD=1
+                else
+                    export TARGET_FWUPD=0
+                fi
+                ui_ok "TARGET_FWUPD=$TARGET_FWUPD"
+            else
+                export TARGET_FWUPD=0
+            fi
+        fi
+
+        export TARGET_FWUPD="${TARGET_FWUPD:-0}"
+        export TARGET_OPENSSH_SERVER="${TARGET_OPENSSH_SERVER:-1}"
+        export TARGET_COCKPIT="${TARGET_COCKPIT:-0}"
+        return 0
+    fi
+
     if [[ -z "${TARGET_FWUPD+x}" ]]; then
         if prompts_enabled; then
             ui_heading "fwupd (firmware updater)"
@@ -2439,8 +2439,8 @@ function interactive_installer_pick() {
 
     ui_heading "Live installer"
     if [[ "${TARGET_DESKTOP:-gnome}" == "none" ]]; then
-        # No Desktop / server profile: only the CLI installer is shipped.
-        echo "    The No Desktop / server ISO ships scripts/cli-installer/install-system"
+        # No Desktop / server / minimal profile: only the CLI installer is shipped.
+        echo "    The Server / Minimal ISO ships scripts/cli-installer/install-system"
         echo "    as its installer. The Calamares / Ubiquity GUI installers are not"
         echo "    available on a TTY-only ISO."
         echo "    1) CLI installer  scripts/cli-installer/install-system (TTY-friendly,"
@@ -2454,22 +2454,25 @@ function interactive_installer_pick() {
             esac
         done
     else
-        echo "    1) Calamares  Default. Project config in scripts/calamares-popos (all releases)"
-        echo "    2) Ubiquity   Classic Ubuntu installer (supported only on jammy / 22.04 LTS)"
+        echo "    1) Calamares      Default. Project config in scripts/calamares-popos (all releases) [default]"
+        echo "    2) Ubiquity       Classic Ubuntu installer (supported only on jammy / 22.04 LTS)"
+        echo "    3) CLI installer  scripts/cli-installer/install-system (terminal / TTY installer)"
 
         local choice
         while true; do
-            read -r -p "  Installer [1/2, Enter=1]: " choice
+            read -r -p "  Installer [1/2/3, Enter=1]: " choice
             case "${choice,,}" in
                 ""|1|c|calamares) export TARGET_INSTALLER="calamares"; break ;;
                 2|u|ubiquity)
                     if [[ "${TARGET_UBUNTU_VERSION:-}" != "jammy" ]]; then
                         ui_warn "Ubiquity is supported only on Ubuntu 22.04 LTS (jammy)."
-                        ui_warn "Current release: '${TARGET_UBUNTU_VERSION:-unknown}'. Choose 1 (Calamares),"
+                        ui_warn "Current release: '${TARGET_UBUNTU_VERSION:-unknown}'. Choose 1 (Calamares) or 3 (CLI installer),"
                         ui_warn "or restart with --release=jammy if you need Ubiquity."
                         continue
                     fi
                     export TARGET_INSTALLER="ubiquity"; break ;;
+                3|cli|cli-installer)
+                    export TARGET_INSTALLER="cli-installer"; break ;;
                 *) ui_warn "Invalid selection: '$choice'." ;;
             esac
         done
@@ -2482,24 +2485,13 @@ function interactive_installer_pick() {
 # chroot_main after the user has had a chance to set TARGET_INSTALLER.
 #   * ubiquity       -> jammy only (graphical installer, no longer packaged
 #                       for noble/resolute)
-#   * cli-installer  -> requires TARGET_DESKTOP=none (the CLI installer
-#                       is the only installer shipped on the "No Desktop"
-#                       / server ISO; pairing it with a desktop build
-#                       makes no sense)
-#   * calamares      -> every release
+#   * calamares      -> every release (requires desktop session)
+#   * cli-installer  -> works on any release and desktop/server/minimal
 function validate_installer_release() {
     if [[ "${TARGET_INSTALLER:-}" == "ubiquity" ]]; then
         if [[ "${TARGET_UBUNTU_VERSION:-}" != "jammy" ]]; then
             echo >&2 "ERROR: Ubiquity is supported only on Ubuntu 22.04 LTS (jammy)."
-            echo >&2 "       This build targets '${TARGET_UBUNTU_VERSION:-unknown}'. Use Calamares instead (e.g. --installer=calamares)."
-            exit 1
-        fi
-    fi
-    if [[ "${TARGET_INSTALLER:-}" == "cli-installer" ]]; then
-        if [[ "${TARGET_DESKTOP:-gnome}" != "none" ]]; then
-            echo >&2 "ERROR: --installer=cli-installer requires --desktop=none (server / minimal profile)."
-            echo >&2 "       The CLI installer is the only installer shipped on the No Desktop ISO."
-            echo >&2 "       For a desktop ISO, use --installer=calamares (default)."
+            echo >&2 "       This build targets '${TARGET_UBUNTU_VERSION:-unknown}'. Use Calamares or cli-installer instead (e.g. --installer=calamares)."
             exit 1
         fi
     fi
@@ -2532,12 +2524,26 @@ function apply_no_desktop_defaults() {
     fi
 
     # Server defaults: openssh-server is the whole point of the profile.
-    if [[ -z "${TARGET_OPENSSH_SERVER+x}" ]]; then
-        export TARGET_OPENSSH_SERVER=1
+    if [[ "${TARGET_PROFILE:-server}" == "server" ]]; then
+        if [[ -z "${TARGET_OPENSSH_SERVER+x}" ]]; then
+            export TARGET_OPENSSH_SERVER=1
+        fi
+        if [[ "${GRUB_LIVEBOOT_LABEL:-}" == "Try Pop!_OS without installing" ]] || \
+           [[ -z "${GRUB_LIVEBOOT_LABEL:-}" ]]; then
+            export GRUB_LIVEBOOT_LABEL="Try Pop!_OS Server without installing"
+        fi
+    else
+        export TARGET_OPENSSH_SERVER="${TARGET_OPENSSH_SERVER:-0}"
+        export TARGET_COCKPIT="${TARGET_COCKPIT:-0}"
+        export TARGET_FWUPD="${TARGET_FWUPD:-0}"
+        if [[ "${GRUB_LIVEBOOT_LABEL:-}" == "Try Pop!_OS without installing" ]] || \
+           [[ -z "${GRUB_LIVEBOOT_LABEL:-}" ]]; then
+            export GRUB_LIVEBOOT_LABEL="Try Pop!_OS Minimal without installing"
+        fi
     fi
 
     # Drop desktop-only knobs (these would not crash, but they would
-    # add a lot of unnecessary disk I/O to a server ISO).
+    # add a lot of unnecessary disk I/O to a server/minimal ISO).
     if [[ -n "${TARGET_KDE_PACKAGE:-}" ]]; then
         ui_warn "TARGET_DESKTOP=none: ignoring TARGET_KDE_PACKAGE=${TARGET_KDE_PACKAGE} (no desktop)."
         export TARGET_KDE_PACKAGE=""
@@ -2582,12 +2588,6 @@ function apply_no_desktop_defaults() {
     if [[ "${TARGET_BRAVE_CHANNEL:-release}" != "none" ]]; then
         ui_warn "TARGET_DESKTOP=none: ignoring TARGET_BRAVE_CHANNEL=${TARGET_BRAVE_CHANNEL} (no browser on a server ISO)."
         export TARGET_BRAVE_CHANNEL="none"
-    fi
-
-    # Live label: the only "Try" entry shows "Try ... Server without installing".
-    if [[ "${GRUB_LIVEBOOT_LABEL:-}" == "Try Pop!_OS without installing" ]] || \
-       [[ -z "${GRUB_LIVEBOOT_LABEL:-}" ]]; then
-        export GRUB_LIVEBOOT_LABEL="Try Pop!_OS Server without installing"
     fi
 }
 
@@ -3471,6 +3471,12 @@ function host_main() {
     if [[ -z "${TARGET_UBUNTU_VERSION:-}" ]]; then
         resolve_release_choice
     fi
+    if [[ -z "${TARGET_KERNEL_FLAVOR:-}" ]]; then
+        resolve_kernel_choice
+    fi
+
+    resolve_iso_profile_and_desktop
+    normalize_desktop_variant
 
     if [[ -z "${TARGET_INSTALLER:-}" ]]; then
         resolve_installer_choice
@@ -3479,13 +3485,6 @@ function host_main() {
 
     validate_installer_release
 
-    if [[ -z "${TARGET_KERNEL_FLAVOR:-}" ]]; then
-        resolve_kernel_choice
-    fi
-    if [[ -z "${TARGET_DESKTOP:-}" ]]; then
-        resolve_desktop_choice
-    fi
-    normalize_desktop_variant
     if [[ -z "${TARGET_NAME:-}" ]]; then
         export TARGET_NAME
         TARGET_NAME="$(default_target_name)"

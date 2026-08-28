@@ -32,9 +32,9 @@
 # TARGET_UBUNTU_VERSION=noble          # jammy | noble | resolute
 # TARGET_UBUNTU_MIRROR=https://archive.ubuntu.com/ubuntu/
 # TARGET_KERNEL_FLAVOR=generic         # generic | lowlatency
-# TARGET_INSTALLER=calamares           # calamares | ubiquity (ubiquity: jammy only) | cli-installer (server ISO only)
+# TARGET_INSTALLER=calamares           # calamares | ubiquity (ubiquity: jammy only) | cli-installer
 # TARGET_DESKTOP=gnome                 # gnome | xfce | lxde | lxqt | mate | cinnamon | budgie | kde-plasma
-#                                      # also: none | server | cli | headless | minimal (TTY-only ISO; pairs with TARGET_INSTALLER=cli-installer)
+#                                      # also: none | server | minimal | really-minimal | cli | headless
 
 # --- Desktop-Specific ---
 # TARGET_KDE_PACKAGE=kde-standard      # kde-full | kde-standard | kde-plasma-desktop
