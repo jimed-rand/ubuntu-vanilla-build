@@ -7,7 +7,7 @@
 # defaults instead.
 #
 # Copy this file to "build.cfg" (in the scripts/ directory) for automatic loading
-# in advanced mode, or use --advanced --config=/path/to/your-config.cfg.
+# in advanced mode, or use --advanced --config=/path/to/your-config.cfg -
 #
 # You can also generate this file interactively with:
 #   ./build.sh --generate-config
@@ -22,6 +22,11 @@
 #   ./build.sh --advanced -
 #   # Or explicitly:
 #   ./build.sh --advanced --config=build.cfg -
+#
+# Note on the trailing '-': it means "run every build stage" and is OPTIONAL.
+#   ./build.sh --advanced --config=build.cfg       # equivalent: runs all stages
+#   ./build.sh --advanced --config=build.cfg -     # equivalent: also runs all stages
+# You only need it when restricting to a stage range, e.g. `setup_host - build_iso`.
 
 # --- Core Build Settings ---
 # TARGET_UBUNTU_VERSION=noble          # jammy | noble | resolute
