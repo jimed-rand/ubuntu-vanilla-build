@@ -322,6 +322,14 @@ function default_target_package_remove() {
         ubiquity)
             echo "ubiquity ubiquity-frontend-gtk ubiquity-ubuntu-artwork ubiquity-slideshow-ubuntu casper discover laptop-detect os-prober"
             ;;
+        cli-installer)
+            # Calamares is never installed in this branch; casper is
+            # stripped by install-system itself (its strip_live_packages
+            # step). We still drop the same "ubiquity leftovers" set
+            # for symmetry, so the manifest does not lie about the ISO
+            # contents.
+            echo "ubiquity ubiquity-frontend-gtk ubiquity-ubuntu-artwork ubiquity-slideshow-ubuntu discover laptop-detect os-prober"
+            ;;
         *)
             >&2 echo "Internal error: default_target_package_remove with TARGET_INSTALLER='${TARGET_INSTALLER:-}'."
             exit 1
@@ -354,9 +362,9 @@ function set_defaults() {
 function set_installer_and_manifest_defaults() {
     export TARGET_INSTALLER="${TARGET_INSTALLER:-calamares}"
     case "${TARGET_INSTALLER}" in
-        calamares|ubiquity) ;;
+        calamares|ubiquity|cli-installer) ;;
         *)
-            >&2 echo "TARGET_INSTALLER must be calamares or ubiquity (got: '${TARGET_INSTALLER}')."
+            >&2 echo "TARGET_INSTALLER must be calamares, ubiquity, or cli-installer (got: '${TARGET_INSTALLER}')."
             exit 1
             ;;
     esac
@@ -378,6 +386,11 @@ function default_target_name() {
     local version desktop
     version="$(release_version "${TARGET_UBUNTU_VERSION:-}")"
     desktop="${TARGET_DESKTOP:-gnome}"
+    if [[ "$desktop" == "none" ]]; then
+        # The "none" profile produces a server ISO; "server" reads better
+        # in the filename than "none".
+        desktop="server"
+    fi
     echo "ubuntu-${version}-${desktop}-amd64-${DATE}"
 }
 
@@ -388,9 +401,20 @@ function normalize_desktop_variant() {
         kde)
             desktop="kde-plasma"
             ;;
+        # "No Desktop" / server / minimal profile: produces a TTY-only ISO
+        # that uses scripts/cli-installer/install-system as its installer.
+        none|server|cli|headless|minimal)
+            desktop="none"
+            ;;
     esac
+    # The "none" profile is special-cased above; the regex check below only
+    # applies to the eight graphical desktop slugs.
+    if [[ "$desktop" == "none" ]]; then
+        export TARGET_DESKTOP="none"
+        return 0
+    fi
     if [[ ! "$desktop" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-        >&2 echo "TARGET_DESKTOP must be a slug like gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, or kde-plasma (got: '${TARGET_DESKTOP:-}')."
+        >&2 echo "TARGET_DESKTOP must be a slug like gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, kde-plasma, or one of: none, server, cli, headless, minimal (got: '${TARGET_DESKTOP:-}')."
         exit 1
     fi
     export TARGET_DESKTOP="$desktop"
@@ -595,6 +619,24 @@ function customize_image() {
                 sddm \
                 xorg
             ;;
+        none)
+            # Server / minimal ISO: no desktop, no display manager. Pulls
+            # the same "standard system utilities" set as the Ubuntu
+            # Server subiquity installer, plus server-only helpers.
+            # --no-install-recommends keeps the seed small; openssh-server
+            # is installed below via the existing TARGET_OPENSSH_SERVER
+            # branch (forced on for this profile in
+            # apply_no_desktop_defaults()).
+            echo "=====> desktop flavor: none (server / minimal ISO)"
+            # Best-effort: whiptail/dialog enable the TUI mode of the CLI
+            # installer; text mode works without them, so do not fail
+            # the build if a release is missing one of them.
+            apt-get install -y --no-install-recommends \
+                ubuntu-server \
+                whiptail \
+                dialog \
+                || apt-get install -y --no-install-recommends ubuntu-server || true
+            ;;
         mate)
             echo "=====> desktop flavor: mate"
             echo "=====> MATE metapackage: ${TARGET_MATE_PACKAGE:-mate-desktop-environment}"
@@ -667,33 +709,43 @@ EOF
             exit 1
             ;;
     esac
-    apt-get install -y plymouth plymouth-label plymouth-theme-ubuntu-text
 
-    # software-properties-common provides add-apt-repository, used below for the
-    # Mozilla PPA; install it explicitly rather than relying on the desktop
-    # stack to pull it in transitively.
-    apt-get install -y curl wget apt-transport-https ca-certificates squashfs-tools gnupg software-properties-common
+    # ---------------------------------------------------------------------
+    # Post-desktop-install work.
+    #
+    # The desktop ISOs install Plymouth, three browser APT sources,
+    # Flatpak, and a few GNOME-app purges. The server / minimal ISO skips
+    # all of that (no graphical boot splash, no browsers, no Flatpak) and
+    # does its own minimal setup instead.
+    # ---------------------------------------------------------------------
+    if [[ "${TARGET_DESKTOP:-gnome}" != "none" ]]; then
+        apt-get install -y plymouth plymouth-label plymouth-theme-ubuntu-text
 
-    install -d /usr/share/keyrings /etc/apt/sources.list.d /etc/apt/preferences.d
+        # software-properties-common provides add-apt-repository, used below for the
+        # Mozilla PPA; install it explicitly rather than relying on the desktop
+        # stack to pull it in transitively.
+        apt-get install -y curl wget apt-transport-https ca-certificates squashfs-tools gnupg software-properties-common
 
-    echo "=====> Browser APT sources (always): Brave release, Librewolf, Mozilla -- install packages only when selected"
-    curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg \
-        https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
-    curl -fsSLo /etc/apt/sources.list.d/brave-browser-release.sources \
-        https://brave-browser-apt-release.s3.brave.com/brave-browser.sources
+        install -d /usr/share/keyrings /etc/apt/sources.list.d /etc/apt/preferences.d
 
-    curl -fsSL https://repo.librewolf.net/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/librewolf.gpg
-    printf '%s\n' \
-        "deb [arch=amd64 signed-by=/usr/share/keyrings/librewolf.gpg] https://repo.librewolf.net/ librewolf main" \
-        > /etc/apt/sources.list.d/librewolf.list
+        echo "=====> Browser APT sources (always): Brave release, Librewolf, Mozilla -- install packages only when selected"
+        curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg \
+            https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+        curl -fsSLo /etc/apt/sources.list.d/brave-browser-release.sources \
+            https://brave-browser-apt-release.s3.brave.com/brave-browser.sources
 
-    wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- \
-        > /usr/share/keyrings/packages.mozilla.org.asc
-    printf '%s\n' \
-        "deb [signed-by=/usr/share/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
-        > /etc/apt/sources.list.d/mozilla.list
-    add-apt-repository ppa:mozillateam/ppa -y
-    cat <<'EOF' > /etc/apt/preferences.d/mozilla
+        curl -fsSL https://repo.librewolf.net/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/librewolf.gpg
+        printf '%s\n' \
+            "deb [arch=amd64 signed-by=/usr/share/keyrings/librewolf.gpg] https://repo.librewolf.net/ librewolf main" \
+            > /etc/apt/sources.list.d/librewolf.list
+
+        wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- \
+            > /usr/share/keyrings/packages.mozilla.org.asc
+        printf '%s\n' \
+            "deb [signed-by=/usr/share/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+            > /etc/apt/sources.list.d/mozilla.list
+        add-apt-repository ppa:mozillateam/ppa -y
+        cat <<'EOF' > /etc/apt/preferences.d/mozilla
 Package: *
 Pin: origin packages.mozilla.org
 Pin-Priority: 1000
@@ -715,102 +767,102 @@ Pin: origin ppa.launchpadcontent.net
 Pin-Priority: 1000
 EOF
 
-    apt-get update
+        apt-get update
 
-    echo "=====> Browser vendor APT: Brave (release), Librewolf, and Mozilla sources + keyrings are always on disk"
-    echo "       (optional installs below only; you can apt install later without re-adding repositories)."
+        echo "=====> Browser vendor APT: Brave (release), Librewolf, and Mozilla sources + keyrings are always on disk"
+        echo "       (optional installs below only; you can apt install later without re-adding repositories)."
 
-    case "${TARGET_BRAVE_CHANNEL:-release}" in
-        release)
-            echo "=====> install: Brave stable"
-            apt-get install -y brave-browser
-            ;;
-        origin)
-            echo "=====> install: Brave Origin"
-            apt-get install -y brave-origin
-            ;;
-        none)
-            echo "=====> Brave: not pre-installed (Brave APT sources above remain; apt install brave-browser | brave-origin when ready)"
-            ;;
-        *)
-            >&2 echo "TARGET_BRAVE_CHANNEL must be none, release, or origin (got: '${TARGET_BRAVE_CHANNEL:-}')."
-            exit 1
-            ;;
-    esac
+        case "${TARGET_BRAVE_CHANNEL:-release}" in
+            release)
+                echo "=====> install: Brave stable"
+                apt-get install -y brave-browser
+                ;;
+            origin)
+                echo "=====> install: Brave Origin"
+                apt-get install -y brave-origin
+                ;;
+            none)
+                echo "=====> Brave: not pre-installed (Brave APT sources above remain; apt install brave-browser | brave-origin when ready)"
+                ;;
+            *)
+                >&2 echo "TARGET_BRAVE_CHANNEL must be none, release, or origin (got: '${TARGET_BRAVE_CHANNEL:-}')."
+                exit 1
+                ;;
+        esac
 
-    if [[ "${TARGET_LIBREWOLF:-0}" == "1" ]]; then
-        apt-get install -y librewolf
-    else
-        echo "=====> Librewolf: not pre-installed (Librewolf repo above remains; apt install librewolf when ready)"
-    fi
+        if [[ "${TARGET_LIBREWOLF:-0}" == "1" ]]; then
+            apt-get install -y librewolf
+        else
+            echo "=====> Librewolf: not pre-installed (Librewolf repo above remains; apt install librewolf when ready)"
+        fi
 
-    if [[ "${TARGET_FIREFOX:-0}" == "1" ]]; then
-        # The desktop metapackage may already have pulled in Ubuntu's
-        # epoch-versioned firefox stub (1:1snapX...) before the Mozilla pin
-        # existed; moving to Mozilla's epoch-less build is then a downgrade,
-        # and -y without --allow-downgrades aborts the build.
-        apt-get install -y --allow-downgrades firefox
-    else
-        echo "=====> Firefox: not pre-installed (Mozilla repo + pin above remain; apt install firefox when ready)"
-    fi
+        if [[ "${TARGET_FIREFOX:-0}" == "1" ]]; then
+            # The desktop metapackage may already have pulled in Ubuntu's
+            # epoch-versioned firefox stub (1:1snapX...) before the Mozilla pin
+            # existed; moving to Mozilla's epoch-less build is then a downgrade,
+            # and -y without --allow-downgrades aborts the build.
+            apt-get install -y --allow-downgrades firefox
+        else
+            echo "=====> Firefox: not pre-installed (Mozilla repo + pin above remain; apt install firefox when ready)"
+        fi
 
-    if [[ "${TARGET_FIREFOX_ESR:-0}" == "1" ]]; then
-        apt-get install -y firefox-esr
-    else
-        echo "=====> Firefox ESR: not pre-installed (Mozilla PPA + pin above remain; apt install firefox-esr when ready)"
-    fi
+        if [[ "${TARGET_FIREFOX_ESR:-0}" == "1" ]]; then
+            apt-get install -y firefox-esr
+        else
+            echo "=====> Firefox ESR: not pre-installed (Mozilla PPA + pin above remain; apt install firefox-esr when ready)"
+        fi
 
-    if [[ "${TARGET_THUNDERBIRD:-0}" == "1" ]]; then
-        apt-get install -y thunderbird
-    else
-        echo "=====> Thunderbird: not pre-installed (Mozilla PPA + pin above remain; apt install thunderbird when ready)"
-    fi
+        if [[ "${TARGET_THUNDERBIRD:-0}" == "1" ]]; then
+            apt-get install -y thunderbird
+        else
+            echo "=====> Thunderbird: not pre-installed (Mozilla PPA + pin above remain; apt install thunderbird when ready)"
+        fi
 
-    if [[ "${TARGET_PACSTALL:-1}" == "1" ]]; then
-        echo "=====> Pacstall (official installer from https://pacstall.dev/q/install -- not Chaotic PPR / apt package)"
-        # Subshell: restore DEBIAN_FRONTEND after upstream script. Pipe declines optional axel; GITHUB_ACTIONS quiets apt.
-        local _pacstall_installer="/tmp/pacstall-install.sh"
-        curl -fsSL https://pacstall.dev/q/install -o "$_pacstall_installer"
-        (
-            export DEBIAN_FRONTEND=noninteractive
-            printf 'n\n' | env GITHUB_ACTIONS=true bash -e "$_pacstall_installer"
-        )
-        rm -f "$_pacstall_installer"
-    else
-        echo "=====> Pacstall: skipped (TARGET_PACSTALL=0)"
-    fi
+        if [[ "${TARGET_PACSTALL:-1}" == "1" ]]; then
+            echo "=====> Pacstall (official installer from https://pacstall.dev/q/install -- not Chaotic PPR / apt package)"
+            # Subshell: restore DEBIAN_FRONTEND after upstream script. Pipe declines optional axel; GITHUB_ACTIONS quiets apt.
+            local _pacstall_installer="/tmp/pacstall-install.sh"
+            curl -fsSL https://pacstall.dev/q/install -o "$_pacstall_installer"
+            (
+                export DEBIAN_FRONTEND=noninteractive
+                printf 'n\n' | env GITHUB_ACTIONS=true bash -e "$_pacstall_installer"
+            )
+            rm -f "$_pacstall_installer"
+        else
+            echo "=====> Pacstall: skipped (TARGET_PACSTALL=0)"
+        fi
 
-    if [[ "${TARGET_UBUNTU_STUDIO:-0}" == "1" ]]; then
-        apt_install_available "Ubuntu Studio metapackages" \
-            ubuntustudio-audio \
-            ubuntustudio-graphics \
-            ubuntustudio-photography \
-            ubuntustudio-publishing \
-            ubuntustudio-video \
-            ubuntustudio-wallpapers \
-            ubuntustudio-menu \
-            ubuntu-edu-music
-    fi
+        if [[ "${TARGET_UBUNTU_STUDIO:-0}" == "1" ]]; then
+            apt_install_available "Ubuntu Studio metapackages" \
+                ubuntustudio-audio \
+                ubuntustudio-graphics \
+                ubuntustudio-photography \
+                ubuntustudio-publishing \
+                ubuntustudio-video \
+                ubuntustudio-wallpapers \
+                ubuntustudio-menu \
+                ubuntu-edu-music
+        fi
 
-    # fwupd stays banned for the whole build (see block_fwupd). Pre-install it
-    # only on explicit request; either way the installed system can add it
-    # later because finish_up() drops the build-time pin.
-    if [[ "${TARGET_FWUPD:-0}" == "1" ]]; then
-        echo "=====> fwupd: pre-installing on request (lifting the build-time block)"
-        unblock_fwupd
-        apt-get install -y fwupd
-    else
-        echo "=====> fwupd: not pre-installed (blocked during build; 'sudo apt install fwupd' works on the installed system)"
-    fi
+        # fwupd stays banned for the whole build (see block_fwupd). Pre-install it
+        # only on explicit request; either way the installed system can add it
+        # later because finish_up() drops the build-time pin.
+        if [[ "${TARGET_FWUPD:-0}" == "1" ]]; then
+            echo "=====> fwupd: pre-installing on request (lifting the build-time block)"
+            unblock_fwupd
+            apt-get install -y fwupd
+        else
+            echo "=====> fwupd: not pre-installed (blocked during build; 'sudo apt install fwupd' works on the installed system)"
+        fi
 
-    if [[ "${TARGET_OPENSSH_SERVER:-0}" == "1" ]]; then
-        echo "=====> OpenSSH server: pre-installing"
-        apt-get install -y openssh-server
-        # The host keys generated by the package postinst are wiped in
-        # finish_up() so every ISO/install does not share the same identity.
-        # This oneshot unit regenerates them on first boot (ssh-keygen -A
-        # only creates keys that are missing), ordered before ssh.service.
-        cat <<'EOF' > /etc/systemd/system/ssh-host-keys-regen.service
+        if [[ "${TARGET_OPENSSH_SERVER:-0}" == "1" ]]; then
+            echo "=====> OpenSSH server: pre-installing"
+            apt-get install -y openssh-server
+            # The host keys generated by the package postinst are wiped in
+            # finish_up() so every ISO/install does not share the same identity.
+            # This oneshot unit regenerates them on first boot (ssh-keygen -A
+            # only creates keys that are missing), ordered before ssh.service.
+            cat <<'EOF' > /etc/systemd/system/ssh-host-keys-regen.service
 [Unit]
 Description=Regenerate missing SSH host keys
 Before=ssh.service
@@ -824,66 +876,148 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl enable ssh-host-keys-regen.service
-    else
-        echo "=====> OpenSSH server: not pre-installed ('sudo apt install openssh-server' when needed)"
-    fi
-
-    # Cockpit upstream recommends the ${release}-backports build for the
-    # latest version (https://cockpit-project.org/running.html#ubuntu);
-    # chroot_prepare adds the backports pocket to sources.list. Fall back to
-    # the main archive if the backports pocket has no cockpit yet.
-    if [[ "${TARGET_COCKPIT:-0}" == "1" ]]; then
-        echo "=====> Cockpit: pre-installing from ${TARGET_UBUNTU_VERSION}-backports"
-        if ! apt-get install -y -t "${TARGET_UBUNTU_VERSION}-backports" cockpit; then
-            echo "=====> Cockpit: no installable candidate in ${TARGET_UBUNTU_VERSION}-backports; installing from the main archive"
-            apt-get install -y cockpit
+            systemctl enable ssh-host-keys-regen.service
+        else
+            echo "=====> OpenSSH server: not pre-installed ('sudo apt install openssh-server' when needed)"
         fi
-    else
-        echo "=====> Cockpit: not pre-installed ('sudo apt install -t ${TARGET_UBUNTU_VERSION}-backports cockpit' when needed)"
-    fi
 
-    apt-get install -y \
-        git \
-        vim \
-        nano \
-        less
+        # Cockpit upstream recommends the ${release}-backports build for the
+        # latest version (https://cockpit-project.org/running.html#ubuntu);
+        # chroot_prepare adds the backports pocket to sources.list. Fall back to
+        # the main archive if the backports pocket has no cockpit yet.
+        if [[ "${TARGET_COCKPIT:-0}" == "1" ]]; then
+            echo "=====> Cockpit: pre-installing from ${TARGET_UBUNTU_VERSION}-backports"
+            if ! apt-get install -y -t "${TARGET_UBUNTU_VERSION}-backports" cockpit; then
+                echo "=====> Cockpit: no installable candidate in ${TARGET_UBUNTU_VERSION}-backports; installing from the main archive"
+                apt-get install -y cockpit
+            fi
+        else
+            echo "=====> Cockpit: not pre-installed ('sudo apt install -t ${TARGET_UBUNTU_VERSION}-backports cockpit' when needed)"
+        fi
 
-    apt-get install -y flatpak
-    flatpak remote-add --if-not-exists --system flathub \
-        https://flathub.org/repo/flathub.flatpakrepo
-
-    if [[ "${TARGET_DESKTOP:-gnome}" == "gnome" ]]; then
         apt-get install -y \
-            gnome-software \
-            gnome-software-plugin-flatpak
-    fi
+            git \
+            vim \
+            nano \
+            less
 
-    apt-get purge -y --ignore-missing \
-        transmission-gtk \
-        transmission-common \
-        aisleriot \
-        hitori
+        apt-get install -y flatpak
+        flatpak remote-add --if-not-exists --system flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
 
-    if [[ "${TARGET_DESKTOP:-gnome}" == "gnome" ]]; then
-        apt-get purge -y --ignore-missing \
-            gnome-mahjongg \
-            gnome-mines \
-            gnome-sudoku
-    fi
-
-    # These slideshow packages may not exist in the target release's repos at all
-    # (not just "not installed"). Filter to only packages dpkg knows about to avoid
-    # "Unable to locate package" errors that would obscure real failures.
-    local _purge_slideshow=()
-    local _pkg
-    for _pkg in ubiquity-slideshow-ubuntu calamares-slideshow-ubuntu; do
-        if dpkg -s "$_pkg" &>/dev/null; then
-            _purge_slideshow+=("$_pkg")
+        if [[ "${TARGET_DESKTOP:-gnome}" == "gnome" ]]; then
+            apt-get install -y \
+                gnome-software \
+                gnome-software-plugin-flatpak
         fi
-    done
-    if [[ ${#_purge_slideshow[@]} -gt 0 ]]; then
-        apt-get purge -y "${_purge_slideshow[@]}"
+
+        apt-get purge -y --ignore-missing \
+            transmission-gtk \
+            transmission-common \
+            aisleriot \
+            hitori
+
+        if [[ "${TARGET_DESKTOP:-gnome}" == "gnome" ]]; then
+            apt-get purge -y --ignore-missing \
+                gnome-mahjongg \
+                gnome-mines \
+                gnome-sudoku
+        fi
+
+        # These slideshow packages may not exist in the target release's repos at all
+        # (not just "not installed"). Filter to only packages dpkg knows about to avoid
+        # "Unable to locate package" errors that would obscure real failures.
+        local _purge_slideshow=()
+        local _pkg
+        for _pkg in ubiquity-slideshow-ubuntu calamares-slideshow-ubuntu; do
+            if dpkg -s "$_pkg" &>/dev/null; then
+                _purge_slideshow+=("$_pkg")
+            fi
+        done
+        if [[ ${#_purge_slideshow[@]} -gt 0 ]]; then
+            apt-get purge -y "${_purge_slideshow[@]}"
+        fi
+    else
+        # -----------------------------------------------------------------
+        # Server / minimal ISO post-install.
+        # -----------------------------------------------------------------
+        # No Plymouth, no browser APT sources, no Flatpak, no GNOME app
+        # purges. Install only what makes a server useful out of the box:
+        #   * openssh-server (already enabled by apply_no_desktop_defaults)
+        #   * git/vim/nano/less (CLI power tools, same as desktop ISO)
+        #   * a one-shot first-boot hint so users know about install-system
+        #   * fwupd / cockpit (still gated on their TARGET_* flags; both
+        #     work fine on a server)
+        # -----------------------------------------------------------------
+        echo "=====> Server / minimal ISO: skipping Plymouth, browser APT sources, Flatpak, GNOME app purges"
+
+        # Common CLI utilities (kept identical to the desktop block for
+        # parity).
+        apt-get install -y \
+            git \
+            vim \
+            nano \
+            less
+
+        if [[ "${TARGET_FWUPD:-0}" == "1" ]]; then
+            echo "=====> fwupd: pre-installing on request (lifting the build-time block)"
+            unblock_fwupd
+            apt-get install -y fwupd
+        else
+            echo "=====> fwupd: not pre-installed (blocked during build; 'sudo apt install fwupd' works on the installed system)"
+        fi
+
+        if [[ "${TARGET_OPENSSH_SERVER:-0}" == "1" ]]; then
+            echo "=====> OpenSSH server: pre-installing"
+            apt-get install -y openssh-server
+            # Same first-boot host-key regen unit the desktop ISO uses.
+            cat <<'EOF' > /etc/systemd/system/ssh-host-keys-regen.service
+[Unit]
+Description=Regenerate missing SSH host keys
+Before=ssh.service
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl enable ssh-host-keys-regen.service
+        else
+            echo "=====> OpenSSH server: not pre-installed ('sudo apt install openssh-server' when needed)"
+        fi
+
+        if [[ "${TARGET_COCKPIT:-0}" == "1" ]]; then
+            echo "=====> Cockpit: pre-installing from ${TARGET_UBUNTU_VERSION}-backports"
+            if ! apt-get install -y -t "${TARGET_UBUNTU_VERSION}-backports" cockpit; then
+                echo "=====> Cockpit: no installable candidate in ${TARGET_UBUNTU_VERSION}-backports; installing from the main archive"
+                apt-get install -y cockpit
+            fi
+        else
+            echo "=====> Cockpit: not pre-installed ('sudo apt install -t ${TARGET_UBUNTU_VERSION}-backports cockpit' when needed)"
+        fi
+
+        # First-boot hint: tell the user about install-system exactly once.
+        # Does not auto-launch the installer (the user must decide when to
+        # run it). One-shot via /var/lib/uvb-cli-installer-hint.shown
+        # sentinel; not strictly necessary (TTY1 always re-displays login
+        # banners) but it makes the discoverability intentional.
+        cat <<'EOF' > /etc/systemd/system/uvb-cli-installer-hint.service
+[Unit]
+Description=Show CLI installer hint on tty1 (one-shot, server ISO only)
+After=multi-user.target
+ConditionPathExists=!/var/lib/uvb-cli-installer-hint.shown
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'printf "\n  *** Ubuntu Server ISO ***\n  Run \x27sudo install-system\x27 to install from this live environment.\n  See /usr/local/bin/install-system --help for details.\n\n" > /dev/console || true'
+ExecStartPost=/bin/touch /var/lib/uvb-cli-installer-hint.shown
+RemainAfterExit=yes
+EOF
+        systemctl enable uvb-cli-installer-hint.service
     fi
 }
 
@@ -967,8 +1101,8 @@ function host_help() {
     echo "  UBUNTU_VANILLA_WORKSPACE=DIR             Parent directory for build workspace (optional; overrides mode defaults:"
     echo "                                           basic = /var/cache/ubuntu-vanilla-build, advanced = ~/uvb-workspace)"
     echo "  UVB_OUTPUT_DIR=DIR                       Directory for the finished ISO + checksums (optional; default: your home directory)"
-    echo "  TARGET_INSTALLER=calamares|ubiquity       Live installer (optional; default calamares)"
-    echo "  TARGET_DESKTOP=<desktop>                  Desktop variant slug (optional; default gnome)"
+    echo "  TARGET_INSTALLER=calamares|ubiquity|cli-installer   Live installer (optional; default calamares; cli-installer for server ISO)"
+    echo "  TARGET_DESKTOP=<desktop>                  Desktop variant slug (optional; default gnome; or none|server|cli|headless|minimal)"
     echo "  TARGET_KDE_PACKAGE=kde-full|kde-standard|kde-plasma-desktop  KDE package when desktop is kde-plasma (optional; default kde-standard)"
     echo "  TARGET_MATE_PACKAGE=mate-desktop-environment|mate-desktop-environment-core  MATE metapackage when desktop is mate (optional; full|core aliases OK)"
     echo "  TARGET_MATE_EXTRAS=0|1            Also install mate-desktop-environment-extras when desktop is mate (optional; default 0)"
@@ -984,8 +1118,10 @@ function host_help() {
     echo "  TARGET_COCKPIT=0|1                       Pre-install Cockpit from the backports pocket (optional; default 0)"
     echo "  TARGET_GNOME_INSTALL_RECOMMENDS=0|1       GNOME install with recommends (optional; default 0)"
     echo "  --kernel=generic|lowlatency             Kernel type to install"
-    echo "  --installer=calamares|ubiquity           Calamares (default), or Ubiquity (jammy/22.04 only)"
-    echo "  --desktop=<desktop>                      Desktop variant (gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, kde-plasma)"
+    echo "  --installer=calamares|ubiquity|cli-installer   Calamares (default), Ubiquity (jammy/22.04 only), or the"
+    echo "                                            bundled CLI installer (server / minimal ISO only)"
+    echo "  --desktop=<desktop>                      Desktop variant (gnome, xfce, lxde, lxqt, mate, cinnamon, budgie,"
+    echo "                                            kde-plasma; or none|server|cli|headless|minimal for a TTY-only server ISO)"
     echo "  --kde=kde-full|kde-standard|kde-plasma-desktop  KDE package tier (used with --desktop=kde-plasma)"
     echo "  --mate=full|core|mate-desktop-environment|mate-desktop-environment-core  MATE tier (used with --desktop=mate; default full)"
     echo "  --mate-extras / --no-mate-extras        Pre-install mate-desktop-environment-extras (with --desktop=mate)"
@@ -1036,8 +1172,9 @@ function host_help() {
     echo "  chroot_prepare   APT sources (release/-security/-updates/-backports), hostname,"
     echo "                   machine-id, snapd + build-time fwupd APT pins."
     echo "  install_pkg      Upgrade the base; install kernel, GRUB, and the live installer"
-    echo "                   (Calamares or Ubiquity), the chosen desktop, browser repos and"
-    echo "                   packages, optional extras, and locale/keyboard settings."
+    echo "                   (Calamares, Ubiquity, or the bundled cli-installer), the chosen"
+    echo "                   desktop (or the server 'none' seed), browser repos and packages,"
+    echo "                   optional extras, and locale/keyboard settings."
     echo "  build_image      Assemble the live /image tree: kernel + initrd, GRUB configs,"
     echo "                   signed EFI binaries, Memtest86+, package manifests, md5sums."
     echo "  finish_up        Cleanup: remove SSH host keys, truncate machine-id, drop the"
@@ -1291,8 +1428,16 @@ function run_chroot() {
     host_priv cp "$SCRIPT_DIR/build.sh" "$WORKSPACE_CHROOT/root/build.sh"
     host_priv cp "$SCRIPT_DIR/host-pkg.sh" "$WORKSPACE_CHROOT/root/host-pkg.sh"
     host_priv rm -rf "$WORKSPACE_CHROOT/root/calamares-config"
-    if [[ -d "$SCRIPT_DIR/calamares" ]]; then
+    if [[ "${TARGET_INSTALLER:-calamares}" != "cli-installer" ]] && [[ -d "$SCRIPT_DIR/calamares" ]]; then
         host_priv cp -a "$SCRIPT_DIR/calamares" "$WORKSPACE_CHROOT/root/calamares-config"
+    fi
+    # Ship the CLI installer into the chroot on every run. The
+    # cli-installer branch of install_pkg() looks for it at
+    # /root/install-system; it is cheap to always copy so the build
+    # host can be re-run with a different TARGET_INSTALLER without
+    # re-bootstrapping.
+    if [[ -f "$SCRIPT_DIR/cli-installer/install-system" ]]; then
+        host_priv cp -a "$SCRIPT_DIR/cli-installer/install-system" "$WORKSPACE_CHROOT/root/install-system"
     fi
 
     # Copy hooks into chroot so chroot-phase hooks can run inside.
@@ -1337,6 +1482,7 @@ function run_chroot() {
     host_priv rm -f "$WORKSPACE_CHROOT/root/build.sh"
     host_priv rm -f "$WORKSPACE_CHROOT/root/host-pkg.sh"
     host_priv rm -rf "$WORKSPACE_CHROOT/root/calamares-config"
+    host_priv rm -f "$WORKSPACE_CHROOT/root/install-system"
     host_priv rm -rf "$WORKSPACE_CHROOT/root/hooks"
 
     unmount_package_cache
@@ -1600,33 +1746,40 @@ function resolve_kernel_choice() {
 
 function interactive_desktop_pick() {
     if ! prompts_enabled; then
-        ui_err "No terminal is available. Use --desktop=<desktop> (e.g. gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, or kde-plasma)."
+        ui_err "No terminal is available. Use --desktop=<desktop> (e.g. gnome, xfce, lxde, lxqt, mate, cinnamon, budgie, kde-plasma, none)."
         exit 1
     fi
 
     ui_heading "Desktop environment"
-    echo "    (Ordered A-Z by desktop name.)"
-    echo "    1) Budgie         Modern GTK desktop with Raven applets/sidebar. budgie-desktop-environment; lightdm + slick-greeter."
-    echo "    2) Cinnamon       Familiar bottom panel and menu layout. cinnamon-desktop-environment; lightdm + slick-greeter."
-    echo "    3) GNOME          Modern, full-featured desktop (similar to stock Ubuntu). Installs vanilla-gnome-desktop; next prompt offers optional extra apps (APT recommends)."
-    echo "    4) KDE            KDE Plasma - flexible and customizable. Next you choose package set: kde-full, kde-standard, or kde-plasma-desktop."
-    echo "    5) LXDE           Very light; best for low-spec or older PCs. lxde metapackage; lightdm + slick-greeter (classic LXDE stack)."
-    echo "    6) LXQt           Lightweight Qt desktop. lxqt + sddm + xorg (no Lubuntu branding metapackages)."
-    echo "    7) MATE           Traditional two-panel layout (GNOME 2 style). You choose full vs core MATE metapackage next, then optional extras."
-    echo "    8) XFCE           Lighter weight, classic taskbar layout. xfce4 + add-ons; display manager lightdm + slick-greeter; includes labwc for an optional Wayland session."
+    echo "    (Ordered A-Z by desktop name. Pick 'None' for a server / minimal ISO.)"
+    echo "    1) <None>        Server / minimal: TTY-only ISO that ships"
+    echo "                     scripts/cli-installer/install-system as the installer."
+    echo "                     No desktop, no display manager, no Flatpak. Pre-installs"
+    echo "                     openssh-server + the 'standard system utilities' set."
+    echo "                     Use this for headless servers, VMs, and very small ISOs."
+    echo "    2) Budgie         Modern GTK desktop with Raven applets/sidebar. budgie-desktop-environment; lightdm + slick-greeter."
+    echo "    3) Cinnamon       Familiar bottom panel and menu layout. cinnamon-desktop-environment; lightdm + slick-greeter."
+    echo "    4) GNOME          Modern, full-featured desktop (similar to stock Ubuntu). Installs vanilla-gnome-desktop; next prompt offers optional extra apps (APT recommends)."
+    echo "    5) KDE            KDE Plasma - flexible and customizable. Next you choose package set: kde-full, kde-standard, or kde-plasma-desktop."
+    echo "    6) LXDE           Very light; best for low-spec or older PCs. lxde metapackage; lightdm + slick-greeter (classic LXDE stack)."
+    echo "    7) LXQt           Lightweight Qt desktop. lxqt + sddm + xorg (no Lubuntu branding metapackages)."
+    echo "    8) MATE           Traditional two-panel layout (GNOME 2 style). You choose full vs core MATE metapackage next, then optional extras."
+    echo "    9) XFCE           Lighter weight, classic taskbar layout. xfce4 + add-ons; display manager lightdm + slick-greeter; includes labwc for an optional Wayland session."
 
     local choice
     while true; do
-        read -r -p "  Desktop [1-8, A-Z by name; Enter=GNOME]: " choice
+        read -r -p "  Desktop [1-9, A-Z by name; Enter=GNOME]: " choice
         case "${choice,,}" in
-            ""|3|g|gnome)               export TARGET_DESKTOP="gnome";   break ;;
-            1|b|budgie)                export TARGET_DESKTOP="budgie";   break ;;
-            2|c|cinnamon)             export TARGET_DESKTOP="cinnamon"; break ;;
-            4|k|kde|kde-plasma)        export TARGET_DESKTOP="kde-plasma"; break ;;
-            5|l|lxde)                  export TARGET_DESKTOP="lxde";    break ;;
-            6|q|lxqt)                  export TARGET_DESKTOP="lxqt";    break ;;
-            7|m|mate)                  export TARGET_DESKTOP="mate";    break ;;
-            8|x|xfce)                  export TARGET_DESKTOP="xfce";    break ;;
+            ""|4|g|gnome)               export TARGET_DESKTOP="gnome";   break ;;
+            1|n|none|no-desktop|server|cli|headless|minimal)
+                                         export TARGET_DESKTOP="none";    break ;;
+            2|b|budgie)                 export TARGET_DESKTOP="budgie";   break ;;
+            3|c|cinnamon)               export TARGET_DESKTOP="cinnamon"; break ;;
+            5|k|kde|kde-plasma)         export TARGET_DESKTOP="kde-plasma"; break ;;
+            6|l|lxde)                   export TARGET_DESKTOP="lxde";    break ;;
+            7|q|lxqt)                   export TARGET_DESKTOP="lxqt";    break ;;
+            8|m|mate)                   export TARGET_DESKTOP="mate";    break ;;
+            9|x|xfce)                   export TARGET_DESKTOP="xfce";    break ;;
             *) ui_warn "Invalid selection: '$choice'." ;;
         esac
     done
@@ -1690,6 +1843,13 @@ function resolve_kde_package_choice() {
 
 function resolve_mate_choice() {
     if [[ "${TARGET_DESKTOP:-gnome}" != "mate" ]]; then
+        if [[ "${TARGET_DESKTOP:-gnome}" == "none" ]]; then
+            # Server profile: leave the values unset so
+            # apply_no_desktop_defaults() can warn/clear them. check_settings()
+            # will not be called for these either way (mate branch only).
+            export TARGET_MATE_EXTRAS=0
+            return 0
+        fi
         export TARGET_MATE_PACKAGE="${TARGET_MATE_PACKAGE:-mate-desktop-environment}"
         export TARGET_MATE_EXTRAS=0
         return 0
@@ -2106,44 +2266,158 @@ function resolve_optional_service_choices() {
 
 function interactive_installer_pick() {
     if ! prompts_enabled; then
-        ui_err "No terminal is available. Use --installer=calamares|ubiquity."
+        ui_err "No terminal is available. Use --installer=calamares|ubiquity|cli-installer."
         exit 1
     fi
 
     ui_heading "Live installer"
-    echo "    1) Calamares  Default. Project config in scripts/calamares (all releases)"
-    echo "    2) Ubiquity   Classic Ubuntu installer (supported only on jammy / 22.04 LTS)"
+    if [[ "${TARGET_DESKTOP:-gnome}" == "none" ]]; then
+        # No Desktop / server profile: only the CLI installer is shipped.
+        echo "    The No Desktop / server ISO ships scripts/cli-installer/install-system"
+        echo "    as its installer. The Calamares / Ubiquity GUI installers are not"
+        echo "    available on a TTY-only ISO."
+        echo "    1) CLI installer  scripts/cli-installer/install-system (TTY-friendly,"
+        echo "                      Calamares-equivalent; ships by default on this profile)"
+        local choice
+        while true; do
+            read -r -p "  Installer [1, Enter=1]: " choice
+            case "${choice,,}" in
+                ""|1|c|cli|cli-installer|installer) export TARGET_INSTALLER="cli-installer"; break ;;
+                *) ui_warn "Invalid selection: '$choice'." ;;
+            esac
+        done
+    else
+        echo "    1) Calamares  Default. Project config in scripts/calamares (all releases)"
+        echo "    2) Ubiquity   Classic Ubuntu installer (supported only on jammy / 22.04 LTS)"
 
-    local choice
-    while true; do
-        read -r -p "  Installer [1/2, Enter=1]: " choice
-        case "${choice,,}" in
-            ""|1|c|calamares) export TARGET_INSTALLER="calamares"; break ;;
-            2|u|ubiquity)
-                if [[ "${TARGET_UBUNTU_VERSION:-}" != "jammy" ]]; then
-                    ui_warn "Ubiquity is supported only on Ubuntu 22.04 LTS (jammy)."
-                    ui_warn "Current release: '${TARGET_UBUNTU_VERSION:-unknown}'. Choose 1 (Calamares),"
-                    ui_warn "or restart with --release=jammy if you need Ubiquity."
-                    continue
-                fi
-                export TARGET_INSTALLER="ubiquity"; break ;;
-            *) ui_warn "Invalid selection: '$choice'." ;;
-        esac
-    done
+        local choice
+        while true; do
+            read -r -p "  Installer [1/2, Enter=1]: " choice
+            case "${choice,,}" in
+                ""|1|c|calamares) export TARGET_INSTALLER="calamares"; break ;;
+                2|u|ubiquity)
+                    if [[ "${TARGET_UBUNTU_VERSION:-}" != "jammy" ]]; then
+                        ui_warn "Ubiquity is supported only on Ubuntu 22.04 LTS (jammy)."
+                        ui_warn "Current release: '${TARGET_UBUNTU_VERSION:-unknown}'. Choose 1 (Calamares),"
+                        ui_warn "or restart with --release=jammy if you need Ubiquity."
+                        continue
+                    fi
+                    export TARGET_INSTALLER="ubiquity"; break ;;
+                *) ui_warn "Invalid selection: '$choice'." ;;
+            esac
+        done
+    fi
     ui_ok "TARGET_INSTALLER=$TARGET_INSTALLER"
 }
 
-# Ubiquity is only validated for jammy; Calamares is used for noble and resolute.
+# Cross-validate (installer, release) combinations. The same rules apply
+# in the host and chroot phases; called from both host_main and
+# chroot_main after the user has had a chance to set TARGET_INSTALLER.
+#   * ubiquity       -> jammy only (graphical installer, no longer packaged
+#                       for noble/resolute)
+#   * cli-installer  -> requires TARGET_DESKTOP=none (the CLI installer
+#                       is the only installer shipped on the "No Desktop"
+#                       / server ISO; pairing it with a desktop build
+#                       makes no sense)
+#   * calamares      -> every release
+function validate_installer_release() {
+    if [[ "${TARGET_INSTALLER:-}" == "ubiquity" ]]; then
+        if [[ "${TARGET_UBUNTU_VERSION:-}" != "jammy" ]]; then
+            echo >&2 "ERROR: Ubiquity is supported only on Ubuntu 22.04 LTS (jammy)."
+            echo >&2 "       This build targets '${TARGET_UBUNTU_VERSION:-unknown}'. Use Calamares instead (e.g. --installer=calamares)."
+            exit 1
+        fi
+    fi
+    if [[ "${TARGET_INSTALLER:-}" == "cli-installer" ]]; then
+        if [[ "${TARGET_DESKTOP:-gnome}" != "none" ]]; then
+            echo >&2 "ERROR: --installer=cli-installer requires --desktop=none (server / minimal profile)."
+            echo >&2 "       The CLI installer is the only installer shipped on the No Desktop ISO."
+            echo >&2 "       For a desktop ISO, use --installer=calamares (default)."
+            exit 1
+        fi
+    fi
+    if [[ "${TARGET_DESKTOP:-gnome}" == "none" ]]; then
+        if [[ "${TARGET_INSTALLER:-}" != "cli-installer" ]]; then
+            echo >&2 "ERROR: --desktop=none requires --installer=cli-installer (got: '${TARGET_INSTALLER:-}')."
+            exit 1
+        fi
+    fi
+}
+
+# Kept for callers that imported the old name; thin alias.
 function validate_ubiquity_jammy_only() {
-    if [[ "${TARGET_INSTALLER:-}" != "ubiquity" ]]; then
-        return 0
+    validate_installer_release
+}
+
+# apply_no_desktop_defaults -- when TARGET_DESKTOP=none, force the
+# matching installer, drop desktop-only choices, enable server extras,
+# and rename the live label. Called once after every resolve_*_choice()
+# has run (so user-set values still win for orthogonal flags like
+# TARGET_PACSTALL / TARGET_COCKPIT / TARGET_FWUPD).
+function apply_no_desktop_defaults() {
+    [[ "${TARGET_DESKTOP:-gnome}" == "none" ]] || return 0
+
+    # Auto-pick the CLI installer if the user did not pick an installer.
+    # If they did pick one, validate_installer_release() will reject
+    # anything that is not cli-installer.
+    if [[ -z "${TARGET_INSTALLER:-}" ]]; then
+        export TARGET_INSTALLER="cli-installer"
     fi
-    if [[ "${TARGET_UBUNTU_VERSION:-}" == "jammy" ]]; then
-        return 0
+
+    # Server defaults: openssh-server is the whole point of the profile.
+    if [[ -z "${TARGET_OPENSSH_SERVER+x}" ]]; then
+        export TARGET_OPENSSH_SERVER=1
     fi
-    echo >&2 "ERROR: Ubiquity is supported only on Ubuntu 22.04 LTS (jammy)."
-    echo >&2 "       This build targets '${TARGET_UBUNTU_VERSION:-unknown}'. Use Calamares instead (e.g. --installer=calamares)."
-    exit 1
+
+    # Drop desktop-only knobs (these would not crash, but they would
+    # add a lot of unnecessary disk I/O to a server ISO).
+    if [[ -n "${TARGET_KDE_PACKAGE:-}" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_KDE_PACKAGE=${TARGET_KDE_PACKAGE} (no desktop)."
+        export TARGET_KDE_PACKAGE=""
+    fi
+    if [[ -n "${TARGET_MATE_PACKAGE:-}" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_MATE_PACKAGE=${TARGET_MATE_PACKAGE} (no desktop)."
+        export TARGET_MATE_PACKAGE=""
+    fi
+    if [[ "${TARGET_MATE_EXTRAS:-0}" == "1" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_MATE_EXTRAS=1 (no desktop)."
+        export TARGET_MATE_EXTRAS=0
+    fi
+    if [[ "${TARGET_GNOME_INSTALL_RECOMMENDS:-0}" == "1" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_GNOME_INSTALL_RECOMMENDS=1 (no desktop)."
+        export TARGET_GNOME_INSTALL_RECOMMENDS=0
+    fi
+    if [[ "${TARGET_UBUNTU_STUDIO:-0}" == "1" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_UBUNTU_STUDIO=1 (no desktop, no studio tools)."
+        export TARGET_UBUNTU_STUDIO=0
+    fi
+    if [[ "${TARGET_LIBREWOLF:-0}" == "1" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_LIBREWOLF=1 (no browser on a server ISO)."
+        export TARGET_LIBREWOLF=0
+    fi
+    if [[ "${TARGET_FIREFOX:-0}" == "1" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_FIREFOX=1 (no browser on a server ISO)."
+        export TARGET_FIREFOX=0
+    fi
+    if [[ "${TARGET_FIREFOX_ESR:-0}" == "1" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_FIREFOX_ESR=1 (no browser on a server ISO)."
+        export TARGET_FIREFOX=0
+        export TARGET_FIREFOX_ESR=0
+    fi
+    if [[ "${TARGET_THUNDERBIRD:-0}" == "1" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_THUNDERBIRD=1 (no email client on a server ISO)."
+        export TARGET_THUNDERBIRD=0
+    fi
+    if [[ "${TARGET_BRAVE_CHANNEL:-release}" != "none" ]]; then
+        ui_warn "TARGET_DESKTOP=none: ignoring TARGET_BRAVE_CHANNEL=${TARGET_BRAVE_CHANNEL} (no browser on a server ISO)."
+        export TARGET_BRAVE_CHANNEL="none"
+    fi
+
+    # Live label: the only "Try" entry shows "Try ... Server without installing".
+    if [[ "${GRUB_LIVEBOOT_LABEL:-}" == "Try Ubuntu without installing" ]] || \
+       [[ -z "${GRUB_LIVEBOOT_LABEL:-}" ]]; then
+        export GRUB_LIVEBOOT_LABEL="Try Ubuntu Server without installing"
+    fi
 }
 
 function resolve_installer_choice() {
@@ -2263,7 +2537,11 @@ function print_build_summary() {
     ui_heading "Build configuration"
     ui_kv "Ubuntu release"  "${TARGET_UBUNTU_VERSION:-?}${hv:+  (Ubuntu ${hv} LTS)}"
     ui_kv "Kernel"          "${TARGET_KERNEL_FLAVOR:-?}${TARGET_KERNEL_PACKAGE:+  [${TARGET_KERNEL_PACKAGE}]}"
-    ui_kv "Desktop"         "${TARGET_DESKTOP:-?}"
+    if [[ "${TARGET_DESKTOP:-gnome}" == "none" ]]; then
+        ui_kv "Desktop"         "none  (server / minimal ISO)"
+    else
+        ui_kv "Desktop"         "${TARGET_DESKTOP:-?}"
+    fi
     case "${TARGET_DESKTOP:-}" in
         gnome)  ui_kv "  with Recommends" "${TARGET_GNOME_INSTALL_RECOMMENDS:-0}" ;;
         kde-plasma) ui_kv "  KDE package" "${TARGET_KDE_PACKAGE:-kde-standard}" ;;
@@ -2625,7 +2903,7 @@ function host_main() {
                 cli_mirror="$2"
                 shift 2
                 ;;
-            --installer=calamares|--installer=ubiquity)
+            --installer=calamares|--installer=ubiquity|--installer=cli-installer)
                 cli_installer="${1#--installer=}"
                 shift
                 ;;
@@ -2970,7 +3248,7 @@ function host_main() {
     fi
     set_installer_and_manifest_defaults
 
-    validate_ubiquity_jammy_only
+    validate_installer_release
 
     if [[ -z "${TARGET_KERNEL_FLAVOR:-}" ]]; then
         resolve_kernel_choice
@@ -2992,6 +3270,11 @@ function host_main() {
     resolve_ubuntu_studio_choice
     resolve_pacstall_choice
     resolve_optional_service_choices
+
+    # Apply the No Desktop / server profile coercion last so every
+    # resolve_*_choice() has had a chance to fill in its defaults, and
+    # check_settings() can see the final shape.
+    apply_no_desktop_defaults
 
     check_settings
     set_target_kernel_package_from_flavor
@@ -3173,6 +3456,21 @@ function install_pkg() {
             fi
             # No-install-recommends prevents ubiquity-slideshow-ubuntu from being pulled in.
             apt-get install -y --no-install-recommends ubiquity ubiquity-frontend-gtk
+            ;;
+        cli-installer)
+            # No installer package: install-system is a bash script that
+            # the build host copies into the chroot at /root/install-system
+            # (see run_chroot in the host phase). Install it into
+            # /usr/local/bin so it is on $PATH on the live system, then
+            # bash -n sanity-check it.
+            if [[ ! -f /root/install-system ]]; then
+                >&2 echo "Internal error: scripts/cli-installer/install-system must be copied into the chroot before install_pkg (the host did not copy it)."
+                exit 1
+            fi
+            install -d /usr/local/bin
+            install -m 0755 /root/install-system /usr/local/bin/install-system
+            bash -n /usr/local/bin/install-system
+            echo "=====> live installer: cli-installer (/usr/local/bin/install-system)"
             ;;
         *)
             >&2 echo "Internal error: unsupported TARGET_INSTALLER: ${TARGET_INSTALLER:-}"
@@ -3410,7 +3708,8 @@ function chroot_main() {
     export TARGET_FWUPD="${TARGET_FWUPD:-0}"
     export TARGET_OPENSSH_SERVER="${TARGET_OPENSSH_SERVER:-0}"
     export TARGET_COCKPIT="${TARGET_COCKPIT:-0}"
-    validate_ubiquity_jammy_only
+    apply_no_desktop_defaults
+    validate_installer_release
     check_settings
     set_target_kernel_package_from_flavor
     check_chroot_root

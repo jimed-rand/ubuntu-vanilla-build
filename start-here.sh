@@ -72,6 +72,8 @@ Examples:
   ${self} --output=img --release=noble --profile=cli -
   ${self} --create-config --distro=ubuntu --output=vm
   ${self} --advanced --distro=ubuntu --config=build.cfg --no-interactive -
+  ${self} --desktop=server --release=noble -  Server / minimal Ubuntu ISO (CLI installer)
+  ${self} --distro=popos --desktop=server -   Server / minimal Pop!_OS ISO (CLI installer)
 EOF
 }
 

@@ -32,8 +32,9 @@
 # TARGET_UBUNTU_VERSION=noble          # jammy | noble | resolute
 # TARGET_UBUNTU_MIRROR=https://archive.ubuntu.com/ubuntu/
 # TARGET_KERNEL_FLAVOR=generic         # generic | lowlatency
-# TARGET_INSTALLER=calamares           # calamares | ubiquity (ubiquity: jammy only)
+# TARGET_INSTALLER=calamares           # calamares | ubiquity (ubiquity: jammy only) | cli-installer (server ISO only)
 # TARGET_DESKTOP=gnome                 # gnome | xfce | lxde | lxqt | mate | cinnamon | budgie | kde-plasma
+#                                      # also: none | server | cli | headless | minimal (TTY-only ISO; pairs with TARGET_INSTALLER=cli-installer)
 
 # --- Desktop-Specific ---
 # TARGET_KDE_PACKAGE=kde-standard      # kde-full | kde-standard | kde-plasma-desktop
@@ -81,3 +82,44 @@
 # --- Interactive Mode ---
 # INTERACTIVE=0                        # Set to 0 to disable all interactive prompts
 # NO_CONFIRM=1                         # Set to 1 to skip the pre-build confirmation prompt
+
+# --- Server / Minimal ISO preset ---
+# Setting TARGET_DESKTOP to one of none|server|cli|headless|minimal switches
+# the build to a TTY-only profile: no desktop, no display manager, no Flatpak,
+# no browser APT sources. Calamares and Ubiquity are not available on this
+# profile; the build forces TARGET_INSTALLER=cli-installer, which ships
+# scripts/cli-installer/install-system as the installer. OpenSSH server is
+# enabled by default; use TARGET_OPENSSH_SERVER=0 to opt out.
+# Browser / desktop-only flags (TARGET_BRAVE_CHANNEL, TARGET_LIBREWOLF,
+# TARGET_FIREFOX[_ESR|_POPOS], TARGET_THUNDERBIRD, TARGET_UBUNTU_STUDIO,
+# TARGET_KDE_PACKAGE, TARGET_MATE_PACKAGE, TARGET_MATE_EXTRAS,
+# TARGET_GNOME_INSTALL_RECOMMENDS) are auto-cleared with a friendly warning
+# when this profile is on. See the "Building a Server / Minimal ISO" section
+# in the README for the full picture.
+#
+# Example: a fully unattended Ubuntu 24.04 server ISO with Cockpit on:
+#   TARGET_UBUNTU_VERSION=noble
+#   TARGET_KERNEL_FLAVOR=generic
+#   TARGET_DESKTOP=server
+#   TARGET_INSTALLER=cli-installer
+#   TARGET_OPENSSH_SERVER=1
+#   TARGET_COCKPIT=1
+#
+# For a Pop!_OS server ISO, mirror the same lines into scripts/build-popos.cfg
+# (its own config file in the same directory).
+
+# --- Server / Minimal ISO ("No Desktop") ---
+# Set TARGET_DESKTOP to one of: none, server, cli, headless, minimal
+# to build a TTY-only ISO. The CLI installer
+# (scripts/cli-installer/install-system) is auto-selected; openssh-server
+# is pre-installed by default; browser, Flatpak, GNOME-app purges, and
+# Plymouth are all skipped.
+#
+# Example unattended server ISO build:
+#   TARGET_DESKTOP=server
+#   TARGET_INSTALLER=cli-installer
+#   TARGET_OPENSSH_SERVER=1
+#   TARGET_COCKPIT=1                  # optional: web admin console from ${release}-backports
+#
+# Equivalent CLI invocation:
+#   ./build.sh --release=noble --kernel=generic --desktop=server -

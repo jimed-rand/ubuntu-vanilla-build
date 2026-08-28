@@ -14,6 +14,7 @@ This project is designed for:
 
 Recent improvements include:
 - **TTY / CLI Installer**: A Calamares-equivalent shell installer now ships on every ISO built by this project — `scripts/cli-installer/install-system`. Useful for installing from a TTY, a minimal/server ISO, or a headless VM console. Mirrors the same `welcome → locale → keyboard → partition → users → summary → mount → unpackfs → … → finished` sequence as the Calamares module list in `scripts/calamares/settings.conf`, and offers both TUI (whiptail/dialog) and plain text prompts. See [Installing from the Live ISO (CLI Installer)](#installing-from-the-live-iso-cli-installer).
+- **Server / Minimal ISO (`--desktop=server|cli|none|headless|minimal`)**: A new "No Desktop" profile produces a small TTY-only ISO that ships the CLI installer as the only installer, drops the desktop metapackage, display manager, Flatpak, and browser APT sources, and pre-installs `openssh-server` plus the Ubuntu "standard system utilities" seed by default. Pick it from the interactive "Desktop environment" prompt or pass `--desktop=server --installer=cli-installer`. See [Building a Server / Minimal ISO](#building-a-server--minimal-iso).
 - **Removable Media Disk Images**: Two new builders produce ready-to-flash raw `.img` files for USB sticks, SD cards, and other removable media — `scripts/build-removable.sh` (Ubuntu) and `scripts/build-popos-removable.sh` (Pop!_OS). Choose UEFI-only or Hybrid (BIOS + UEFI) firmware, sparse truncate / fallocate / dd allocation, image size 8/16/32/64 GB or custom, a desktop-ready or CLI/TTY-only profile, and whether to bake user credentials in at build time or create the user after deployment via a first-boot console wizard. Partition layout adapts to image size (8 GB → 2 GB swap, 16 GB+ → 4 GB swap) and `growpart` resizes root on first boot so a smaller image works on larger media. See [Building Removable Media Disk Images](#building-removable-media-disk-images). `start-here.sh` now also offers
 - **Cloud & VM Disk Images**: Four new builders produce ready-to-use disk images instead of a live-installer ISO — `scripts/build-img.sh` (Ubuntu cloud `.img`), `scripts/build-vm.sh` (Ubuntu VM image with QCOW2/VDI/VMDK/VHDX exports), and their Pop!_OS counterparts `scripts/build-popos-img.sh` / `scripts/build-popos-vm.sh`. Choose UEFI-only or Hybrid (BIOS + UEFI) firmware, netplan/systemd-networkd or NetworkManager, the image allocation tool (sparse truncate, fallocate, or dd), disk size 32/64/128 GB or custom (fixed layout: 512 MB ESP + 4 GB swap + root gets the rest), a desktop-ready or CLI/TTY-only profile, and whether to bake user credentials in at build time or create the user after deployment (cloud-init for cloud images, a first-boot console wizard for VM images). See [Building Cloud & VM Disk Images](#building-cloud--vm-disk-images). `start-here.sh` now also asks which output type to build (`--output=iso|img|vm`).
 - **Pop!_OS ISO Variant**: `scripts/build-popos.sh` builds a Pop!_OS ISO from the official Pop!_OS APT repositories (staging excluded) — see [Building Pop!_OS ISOs](#building-popos-isos). `start-here.sh` now asks which distro to build (Ubuntu or Pop!_OS).
@@ -45,9 +46,11 @@ Recent improvements include:
   - `cinnamon` (`cinnamon-desktop-environment` with `lightdm` and `slick-greeter`)
   - `budgie` (`budgie-desktop-environment` with `lightdm` and `slick-greeter`)
   - `kde-plasma` (KDE Plasma with selectable APT metapackage: `kde-full`, `kde-standard`, or `kde-plasma-desktop`)
+  - `none` / `server` / `cli` / `headless` / `minimal` — TTY-only server / minimal ISO; pairs with `cli-installer` (see [Building a Server / Minimal ISO](#building-a-server--minimal-iso))
 - **Installer choices**:
   - `calamares` (default, all supported releases)
   - `ubiquity` (jammy only)
+  - `cli-installer` (server / minimal ISO; ships [`scripts/cli-installer/install-system`](scripts/cli-installer/install-system))
 - **Browser repositories configured for**:
   - Brave (stable + Brave Origin, a minimalist privacy-focused build)
   - LibreWolf
@@ -105,6 +108,92 @@ sudo apt install cosmic-session
 ```
 
 Then log out and pick the **COSMIC** session from the session menu on the login screen. For the full Pop!_OS desktop stack instead, install `pop-desktop`. (The build also prints this note at the end of every noble/resolute Pop!_OS build.)
+
+---
+
+## Building a Server / Minimal ISO
+
+A "No Desktop" / server profile is available on the **live-installer ISOs** (Ubuntu and Pop!_OS). It produces a much smaller ISO that boots straight to a TTY login, ships no display manager, no graphical desktop, no browsers, and no Flatpak, and uses the bundled [`scripts/cli-installer/install-system`](scripts/cli-installer/install-system) as its installer (Calamares and Ubiquity are GUI installers and do not fit a TTY-only ISO).
+
+### How to build one
+
+Pick `None / Server` from the "Desktop environment" prompt in the interactive wizard, or pass `--desktop=server` on the command line. The string `--desktop=none`, `--desktop=cli`, `--desktop=headless`, and `--desktop=minimal` are all accepted aliases; the build normalises them to `TARGET_DESKTOP=none` and the ISO filename uses `server` (e.g. `ubuntu-24.04-server-amd64-260826-120000.iso`).
+
+```bash
+# Interactive (Ubuntu):
+cd scripts
+./build.sh --release=noble --desktop=server -
+
+# Pop!_OS server ISO:
+./build-popos.sh --release=noble --desktop=server -
+
+# Or via start-here.sh:
+./start-here.sh --desktop=server --release=noble -
+./start-here.sh --distro=popos --desktop=server --release=noble -
+```
+
+The interactive "Installer" prompt only offers the CLI installer once `desktop=server` is picked; the other installer choices are skipped because they are graphical and would not run on a TTY-only ISO.
+
+### What the server ISO ships
+
+| Component | What the build does |
+| --- | --- |
+| **Kernel** | Same HWE kernel choice (`--kernel=generic\|lowlatency`; Pop!_OS also offers `--kernel=system76`) as the desktop ISOs |
+| **Base** | `ubuntu-server` (the same seed the Ubuntu Server subiquity installer uses) plus `whiptail` and `dialog` so the installer's TUI mode works |
+| **Installer** | [`scripts/cli-installer/install-system`](scripts/cli-installer/install-system) is copied to `/usr/local/bin/install-system` and made executable; Calamares / Ubiquity are **not** installed and their APT sources are not added to the chroot |
+| **OpenSSH server** | Pre-installed and enabled by default. Use `--no-openssh-server` to skip. A first-boot unit regenerates per-host SSH keys (every install gets a unique identity, even on the same ISO file) |
+| **Network** | `network-manager` is still installed; `netplan` / `networkd` are not pulled in (Calamares' `networkcfg` module is irrelevant on this ISO) |
+| **fwupd, Cockpit** | Off by default; turn on with `--fwupd` / `--cockpit` (Cockpit installs from the `${release}-backports` pocket for the latest version) |
+| **Browsers, Flatpak, Plymouth** | **Skipped** entirely — none of them are useful on a TTY-only ISO and adding them would just bloat the squashfs |
+| **Pacstall** | Skipped (Pacstall is a desktop-leaning tool; the default was desktop-only). Use `--pacstall` to re-enable it |
+
+A one-shot systemd unit (`uvb-cli-installer-hint.service`) prints a hint on the first boot:
+
+```
+*** Ubuntu Server ISO ***
+Run 'sudo install-system' to install from this live environment.
+See /usr/local/bin/install-system --help for details.
+```
+
+The installer is **not** auto-launched — you stay on the live shell, can inspect the environment, then run `sudo install-system` when ready.
+
+### Unattended build
+
+```bash
+# Ubuntu Server ISO, no UI, builds every stage:
+cd scripts
+./build.sh --advanced --no-interactive \
+    --release=noble --kernel=generic --desktop=server -
+
+# Pop!_OS Server ISO, unattended, Cockpit on, OpenSSH off (you can install openssh-server later):
+./build-popos.sh --advanced --no-interactive \
+    --release=noble --kernel=system76 --desktop=server \
+    --no-openssh-server --cockpit -
+```
+
+Or set the same options in a `build.cfg` (advanced mode):
+
+```ini
+TARGET_DESKTOP=server
+TARGET_INSTALLER=cli-installer
+TARGET_OPENSSH_SERVER=1
+TARGET_COCKPIT=0
+```
+
+### Boot the resulting ISO
+
+The ISO uses the same hybrid BIOS+UEFI GRUB layout as the desktop ISOs. The default GRUB menu entry is labelled "Try Ubuntu Server without installing" (or "Try Pop!_OS Server without installing"). After the live kernel boots you are dropped at a TTY login prompt — the user `ubuntu` / `popos` is created by casper with passwordless `sudo` (same as the desktop ISOs).
+
+```bash
+# log in as the casper user, then:
+sudo install-system
+# pick TUI (whiptail/dialog) or plain text mode at the welcome screen,
+# then follow the same wizard the desktop installer uses
+```
+
+### Differences from the cloud/VM/removable builders
+
+The cloud/VM/removable builders (`build-img.sh`, `build-vm.sh`, `build-removable.sh`, and their Pop!_OS counterparts) already have a `--profile=cli` flag that drops the desktop and ships only `openssh-server` + `cloud-init` / first-boot wizard. The new `--desktop=server` profile is the **same idea**, but produces a *live-installer ISO* instead of a pre-installed disk image — you boot it, the live shell starts, and you run `install-system` to put the system on a real disk. Pick whichever output type matches the use case: ISO for a USB stick you'll re-use on different hardware; cloud/VM/removable for a deployment artifact.
 
 ---
 
@@ -219,6 +308,8 @@ The first boot takes a few seconds longer than usual while growpart resizes the 
 ---
 
 ## Installing from the Live ISO (CLI Installer)
+
+> The server / minimal ISO (`--desktop=server`) ships this installer as its **only** installer and boots straight to a TTY login. See [Building a Server / Minimal ISO](#building-a-server--minimal-iso) for the build side; this section covers the installer itself.
 
 Once you have built an ISO (Ubuntu or Pop!_OS) and booted a machine from it, the desktop variant launches **Calamares** automatically. A pure TTY/CLI environment has no desktop, so this project ships a Calamares-equivalent shell installer that walks the user through the same stages from a terminal:
 
@@ -400,9 +491,9 @@ The script is interactive by default on a TTY when required values are missing. 
 
 - **Build mode**: Basic (default) or Advanced — asked first, unless `--advanced` or `ADVANCED_MODE` was given
 - **Release**: `jammy`, `noble`, or `resolute`
-- **Installer**: `calamares` or `ubiquity` (Ubiquity is validated for jammy only)
-- **Kernel flavor**: `generic` or `lowlatency`
-- **Desktop**: `gnome`, `xfce`, `lxde`, `lxqt`, `mate`, `cinnamon`, `budgie`, or `kde-plasma`
+- **Installer**: `calamares`, `ubiquity` (Ubiquity is validated for jammy only), or `cli-installer` (only offered when the desktop is `none` / `server`; forces `--desktop=server` and skips the Calamares / Ubiquity prompt)
+- **Kernel flavor**: `generic` or `lowlatency` (Pop!_OS also offers `system76`)
+- **Desktop**: `gnome`, `xfce`, `lxde`, `lxqt`, `mate`, `cinnamon`, `budgie`, `kde-plasma`, or `none` / `server` / `cli` / `headless` / `minimal` for a TTY-only server ISO (see [Building a Server / Minimal ISO](#building-a-server--minimal-iso))
 - **KDE package tier** (when desktop is `kde-plasma`): `kde-standard`, `kde-plasma-desktop`, or `kde-full`
 - **MATE metapackage** (when desktop is `mate`): `mate-desktop-environment` or `mate-desktop-environment-core`, plus optional MATE extras
 - **GNOME recommends toggle** (GNOME only): Enable/disable recommends for GNOME
@@ -426,6 +517,7 @@ If values are not explicitly set and interactive prompts are skipped, the defaul
 - **Ubuntu Studio**: Disabled
 - **GNOME Recommends**: Disabled
 - **Pacstall**: Enabled
+- **OpenSSH server**: Disabled (forced **on** when `--desktop=server` is set; use `--no-openssh-server` to opt out)
 
 ---
 
@@ -435,8 +527,8 @@ If values are not explicitly set and interactive prompts are skipped, the defaul
 - `--release=jammy|noble|resolute` - Target Ubuntu release.
 - `--mirror=URL` - Ubuntu package mirror (default: `https://archive.ubuntu.com/ubuntu/`).
 - `--kernel=generic|lowlatency` - Kernel flavor.
-- `--installer=calamares|ubiquity` - Installer type.
-- `--desktop=<desktop>` - Desktop environment slug.
+- `--installer=calamares|ubiquity|cli-installer` - Installer type. `cli-installer` is forced when `--desktop=server` is set.
+- `--desktop=<desktop>` - Desktop environment slug. One of `gnome`, `xfce`, `lxde`, `lxqt`, `mate`, `cinnamon`, `budgie`, `kde-plasma`, or `none` / `server` / `cli` / `headless` / `minimal` for a TTY-only server ISO (see [Building a Server / Minimal ISO](#building-a-server--minimal-iso)).
 
 ### Desktop-Specific Options
 - `--kde=kde-full|kde-standard|kde-plasma-desktop` - KDE package tier.
